@@ -1,0 +1,35 @@
+# doris-ingress node configuration. Run: doris-ingress config.toml
+node_id = 1
+data_dir = "/var/lib/doris-ingress"
+raft_listen = "0.0.0.0:7701"
+raft_advertise = "10.0.0.1:7701"
+flight_listen = "0.0.0.0:8815"
+# First start only: the node with the lowest id initializes the cluster with these voters.
+initial_members = [[1, "10.0.0.1:7701"], [2, "10.0.0.2:7701"], [3, "10.0.0.3:7701"]]
+memory_target_mb = 8192
+max_concurrent_loads = 4
+
+[users]            # Flight SQL / ADBC credentials
+admin = "env:DORIS_INGRESS_ADMIN_PASSWORD"
+
+[doris]
+http_url = "https://fe.example.com:8080"   # Stream Load (HTTPS)
+mysql_host = "fe.example.com"
+mysql_port = 9030
+user = "loader"
+password = "env:DORIS_PASSWORD"
+tls = true
+# Required for loader = "broker":
+# [doris.s3]
+# endpoint = "https://s3.ap-southeast-1.amazonaws.com"
+# region = "ap-southeast-1"
+# bucket = "doris-ingress-staging"
+# prefix = "loads"
+# access_key = "env:AWS_ACCESS_KEY_ID"
+# secret_key = "env:AWS_SECRET_ACCESS_KEY"
+
+[[tables]]
+name = "db.orders"           # must be Unique Key, merge-on-write, with a sequence column
+loader = "stream"            # or "broker"
+flush_interval_ms = 2000
+grace_ms = 10000
