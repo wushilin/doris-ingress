@@ -63,7 +63,7 @@ impl Memtable {
             return 0;
         }
         let batch_idx = self.batches.len() as u32;
-        let mut added = batch.get_array_memory_size();
+        let mut added = crate::ipc::batch_memory_size(&batch);
         for row in 0..n {
             let v = Version { seq: base_seq + row as u64, batch: batch_idx, row: row as u32, deleted };
             let key = keys.row(row);

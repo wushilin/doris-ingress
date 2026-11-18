@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doris-ingress SQL console</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<style>
+:root {
+  --bg: #ffffff; --panel: #f6f7f9; --border: #dfe3e8; --text: #1c2430; --muted: #6b7684;
+  --accent: #2563eb; --accent-text: #ffffff; --hover: #e9edf3; --error: #b42318; --error-bg: #fef3f2;
+  --key: #b45309; --null: #9aa4b1; --stripe: #fafbfc;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c; --panel: #1b1f26; --border: #2c323b; --text: #e3e7ed; --muted: #8c96a3;
+    --accent: #4f8bf5; --accent-text: #0b1220; --hover: #252b34; --error: #f97066; --error-bg: #2a1614;
+    --key: #f0a94a; --null: #6b7684; --stripe: #181c22;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header .node { margin-left: auto; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.layout { flex: 1; display: flex; min-height: 0; }
+
+aside { width: 270px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); min-height: 0; }
+.side-head { display: flex; align-items: center; gap: 6px; padding: 10px 10px 6px; }
+.side-head span { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); flex: 1; }
+#filter { margin: 0 10px 8px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px; }
+#tree { flex: 1; overflow: auto; padding: 0 4px 10px; font-size: 13px; }
+.db { padding: 6px 8px 2px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.tbl { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 5px; cursor: pointer; user-select: none; }
+.tbl:hover { background: var(--hover); }
+.tbl .caret { width: 12px; color: var(--muted); font-size: 10px; flex: none; }
+.tbl .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.tbl button { visibility: hidden; }
+.tbl:hover button, .tbl button:focus { visibility: visible; }
+.cols { margin: 0 0 4px 22px; padding: 0; list-style: none; }
+.cols li { display: flex; gap: 8px; padding: 1px 6px; font-family: var(--mono); font-size: 12px; border-radius: 4px; cursor: pointer; }
+.cols li:hover { background: var(--hover); }
+.cols .cname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cols .ctype { color: var(--muted); white-space: nowrap; }
+.cols .pk { color: var(--key); font-weight: 600; }
+.empty { padding: 10px; color: var(--muted); font-size: 13px; }
+
+main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.editor { height: 230px; min-height: 90px; max-height: 70vh; resize: vertical; overflow: hidden; border-bottom: 1px solid var(--border); }
+.editor textarea { width: 100%; height: 100%; border: 0; padding: 10px; resize: none; outline: none;
+  background: var(--bg); color: var(--text); font: 13px/1.5 var(--mono); }
+.CodeMirror { height: 100%; font: 13px/1.5 var(--mono); background: var(--bg); color: var(--text); }
+.CodeMirror-gutters { background: var(--panel); border-right: 1px solid var(--border); }
+.CodeMirror-linenumber { color: var(--muted); }
+.CodeMirror-cursor { border-left-color: var(--text); }
+.CodeMirror-selected, .CodeMirror-focused .CodeMirror-selected { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+@media (prefers-color-scheme: dark) {
+  .cm-s-default .cm-keyword { color: #c792ea; } .cm-s-default .cm-string { color: #c3e88d; }
+  .cm-s-default .cm-number { color: #f78c6c; } .cm-s-default .cm-comment { color: #7d8794; }
+  .cm-s-default .cm-builtin, .cm-s-default .cm-atom { color: #82aaff; }
+  .cm-s-default .cm-variable-2, .cm-s-default .cm-operator { color: var(--text); }
+}
+.toolbar { display: flex; align-items: center; gap: 12px; padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+button { font: inherit; font-size: 12px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text); cursor: pointer; }
+button:hover { background: var(--hover); }
+button.primary { font-size: 13px; padding: 5px 14px; background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button:disabled { opacity: .55; cursor: default; }
+kbd { font: 11px var(--mono); color: var(--muted); }
+#status { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#result { flex: 1; overflow: auto; min-height: 0; }
+#result table { border-collapse: separate; border-spacing: 0; font: 12.5px/1.4 var(--mono); }
+#result th, #result td { padding: 4px 10px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  white-space: pre; max-width: 480px; overflow: hidden; text-overflow: ellipsis; text-align: left; vertical-align: top; }
+#result th { position: sticky; top: 0; background: var(--panel); font-weight: 600; z-index: 1; }
+#result th small { display: block; color: var(--muted); font-weight: 400; }
+#result tr:nth-child(even) td { background: var(--stripe); }
+#result .num { text-align: right; }
+#result .rn { color: var(--muted); text-align: right; background: var(--panel) !important; position: sticky; left: 0; }
+#result th.rn { z-index: 2; }
+#result .null { color: var(--null); font-style: italic; }
+dialog { width: min(520px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg); color: var(--text); box-shadow: 0 12px 40px rgba(0, 0, 0, .25); }
+dialog::backdrop { background: rgba(0, 0, 0, .4); }
+dialog h2 { margin: 0; padding: 12px 16px; font-size: 15px; border-bottom: 1px solid var(--border); background: var(--panel); }
+dialog .body { padding: 14px 16px; }
+dialog p { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
+.fields label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.fields label.wide { grid-column: 1 / -1; }
+.fields input, .fields select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg);
+  color: var(--text); font: 13px var(--mono); min-width: 0; }
+.progress { margin-top: 14px; }
+.bar { height: 10px; border-radius: 5px; background: var(--hover); overflow: hidden; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s linear; }
+.bar.failed > div { background: var(--error); }
+#bulkText, #bqText { white-space: pre-wrap; }
+table.mini { width: 100%; margin-top: 10px; border-collapse: collapse; font: 12px/1.4 var(--mono); }
+table.mini th, table.mini td { padding: 3px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+table.mini th { color: var(--muted); font-weight: 500; }
+table.mini th:first-child, table.mini td:first-child { text-align: left; }
+table.mini td.left, table.mini th.left { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+table.mini .down { color: var(--error); }
+table.mini .lead { color: var(--key); font-weight: 600; }
+.scroll { overflow-x: auto; }
+dialog.wide { width: min(1080px, calc(100vw - 32px)); }
+dialog h3 { margin: 16px 0 0; font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+dialog h3:first-child { margin-top: 0; }
+#clusterBadge { font: 12px var(--mono); color: var(--muted); cursor: pointer; border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; }
+#clusterBadge.down { color: var(--error); border-color: var(--error); }
+#bqText { margin-top: 6px; font: 12.5px/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+#bqText.bad { color: var(--error); }
+#bqBadge { font: 12px var(--mono); color: var(--muted); cursor: pointer; }
+#bulkText { margin-top: 6px; font: 12.5px/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+#bulkText.bad { color: var(--error); }
+dialog .actions { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+dialog .actions button { font-size: 13px; padding: 5px 12px; }
+#bulkBadge { font: 12px var(--mono); color: var(--muted); cursor: pointer; }
+.error { margin: 14px; padding: 10px 12px; border: 1px solid var(--error); border-radius: 6px; background: var(--error-bg);
+  color: var(--error); font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <h1>doris-ingress SQL console</h1>
+  <span id="clusterBadge" role="button" tabindex="0" title="Cluster overview">Cluster…</span>
+  <button id="bulkOpen" title="Fill a table with generated rows">Bulk insert…</button>
+  <span id="bulkBadge" title="Bulk insert progress"></span>
+  <button id="bqOpen" title="Run parallel point lookups and measure queries per second">Bulk query…</button>
+  <span id="bqBadge" title="Bulk query progress"></span>
+  <span class="node" id="node"></span>
+</header>
+<dialog id="cluster" class="wide">
+  <h2>Cluster overview</h2>
+  <div class="body">
+    <h3>Nodes</h3>
+    <div class="scroll" id="clusterNodes"></div>
+    <h3 id="clusterTablesTitle">Tables</h3>
+    <div class="scroll" id="clusterTables"></div>
+    <p id="clusterNote" style="margin: 12px 0 0"></p>
+  </div>
+  <div class="actions"><button id="clusterClose">Close</button></div>
+</dialog>
+<dialog id="bq">
+  <h2>Bulk query by primary key</h2>
+  <div class="body">
+    <p>Parallel clients look up random ids by primary key for a set time, each through a prepared
+      statement, spread over the nodes. Shows queries per second and latency.</p>
+    <div class="fields">
+      <label class="wide">Table<select id="bqTable"></select></label>
+      <label>First id<input id="bqStart" type="number" min="0" value="0"></label>
+      <label>Number of ids<input id="bqIds" type="number" min="1" value="10000000"></label>
+      <label>Parallel clients<input id="bqClients" type="number" min="1" max="1024" value="32"></label>
+      <label>Duration (seconds)<input id="bqSeconds" type="number" min="1" max="3600" value="10"></label>
+    </div>
+    <div class="progress">
+      <div class="bar" id="bqBar"><div></div></div>
+      <div id="bqText">No bulk query has run yet.</div>
+      <div class="scroll" id="bqNodes"></div>
+    </div>
+  </div>
+  <div class="actions">
+    <button id="bqCancel" hidden>Stop queries</button>
+    <button id="bqClose">Close</button>
+    <button id="bqStartBtn" class="primary">Start</button>
+  </div>
+</dialog>
+<dialog id="bulk">
+  <h2>Bulk insert generated rows</h2>
+  <div class="body">
+    <p>Writes rows with consecutive ids in the key column and random values in every other column,
+      through Flight SQL bulk ingest. A row whose id already exists is replaced.</p>
+    <div class="fields">
+      <label class="wide">Table<select id="bulkTable"></select></label>
+      <label>Rows<input id="bulkRows" type="number" min="1" value="10000000"></label>
+      <label>First id<input id="bulkStart" type="number" min="0" value="0"></label>
+      <label>Rows per batch<input id="bulkBatch" type="number" min="1" max="100000" value="10000"></label>
+      <label>Parallel writers<input id="bulkWriters" type="number" min="1" max="64" value="8"></label>
+      <label class="wide">Rate limit, rows per second (0 = no limit)<input id="bulkRate" type="number" min="0" value="50000"></label>
+    </div>
+    <div class="progress">
+      <div class="bar" id="bulkBar"><div></div></div>
+      <div id="bulkText">No bulk insert has run yet.</div>
+      <div class="scroll" id="bulkNodes"></div>
+    </div>
+  </div>
+  <div class="actions">
+    <button id="bulkCancel" hidden>Cancel insert</button>
+    <button id="bulkClose">Close</button>
+    <button id="bulkStartBtn" class="primary">Start</button>
+  </div>
+</dialog>
+<div class="layout">
+  <aside>
+    <div class="side-head"><span>Tables</span><button id="refresh" title="Reload the table list">Refresh</button></div>
+    <input id="filter" type="search" placeholder="Filter tables" aria-label="Filter tables">
+    <div id="tree"><div class="empty">Loading…</div></div>
+  </aside>
+  <main>
+    <div class="editor"><textarea id="sql" spellcheck="false" aria-label="SQL"></textarea></div>
+    <div class="toolbar">
+      <button class="primary" id="run">Run</button>
+      <kbd id="hint"></kbd>
+      <span id="status">Runs the selected text, or the whole editor when nothing is selected.</span>
+    </div>
+    <div id="result"></div>
+  </main>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// Editor: CodeMirror when the CDN is reachable, a plain textarea otherwise.
+const ta = $('#sql');
+ta.value = store.get('sql') || '';
+let cm = null;
+if (window.CodeMirror) {
+  cm = CodeMirror.fromTextArea(ta, {
+    mode: 'text/x-sql', lineNumbers: true, indentUnit: 2, autofocus: true,
+    extraKeys: { 'Cmd-Enter': () => run(), 'Ctrl-Enter': () => run() },
+  });
+  cm.on('change', () => store.set('sql', cm.getValue()));
+} else {
+  ta.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+  });
+  ta.addEventListener('input', () => store.set('sql', ta.value));
+}
+$('#hint').textContent = (navigator.platform.includes('Mac') ? '⌘' : 'Ctrl') + ' + Enter';
+
+function currentSQL() {
+  if (cm) return cm.getSelection().trim() || cm.getValue();
+  return ta.value.slice(ta.selectionStart, ta.selectionEnd).trim() || ta.value;
+}
+function setSQL(sql) {
+  if (cm) { cm.setValue(sql); cm.focus(); } else { ta.value = sql; ta.focus(); }
+  store.set('sql', sql);
+}
+function insertText(text) {
+  if (cm) { cm.replaceSelection(text); cm.focus(); }
+  else { ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end'); ta.focus(); store.set('sql', ta.value); }
+}
+
+async function api(path, body, method) {
+  const resp = await fetch(path, body === undefined ? { method: method || 'GET' } : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  let data;
+  try { data = await resp.json(); } catch { throw new Error('HTTP ' + resp.status); }
+  if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+  return data;
+}
+
+// Tables
+let tables = [];
+const open = new Set();
+async function loadTables() {
+  const tree = $('#tree');
+  try {
+    const data = await api('/api/tables');
+    tables = data.tables;
+    $('#node').textContent = data.node;
+    renderTables();
+  } catch (e) {
+    tree.replaceChildren(el('div', 'error', e.message));
+  }
+}
+function renderTables() {
+  const tree = $('#tree');
+  const q = $('#filter').value.trim().toLowerCase();
+  const shown = tables.filter((t) => (t.db + '.' + t.name).toLowerCase().includes(q));
+  if (!shown.length) {
+    tree.replaceChildren(el('div', 'empty', tables.length ? 'No table matches the filter.' : 'No tables are attached yet.'));
+    return;
+  }
+  const nodes = [];
+  let db = null;
+  for (const t of shown) {
+    if (t.db !== db) { db = t.db; nodes.push(el('div', 'db', db)); }
+    const full = t.db + '.' + t.name;
+    const row = el('div', 'tbl');
+    row.title = full;
+    row.append(el('span', 'caret', open.has(full) ? '▼' : '▶'), el('span', 'name', t.name));
+    const go = el('button', '', 'Query');
+    go.title = 'SELECT * FROM ' + full + ' LIMIT 100';
+    go.onclick = (e) => { e.stopPropagation(); setSQL('SELECT * FROM ' + full + ' LIMIT 100'); run(); };
+    row.append(go);
+    row.onclick = () => { open.has(full) ? open.delete(full) : open.add(full); renderTables(); };
+    nodes.push(row);
+    if (open.has(full)) {
+      const ul = el('ul', 'cols');
+      for (const c of t.columns) {
+        const li = el('li');
+        li.title = 'Insert ' + c.name + ' into the editor';
+        li.append(el('span', 'cname' + (c.key ? ' pk' : ''), c.name), el('span', 'ctype', c.type + (c.key ? ' · key' : '')));
+        li.onclick = () => insertText(c.name);
+        ul.append(li);
+      }
+      nodes.push(ul);
+    }
+  }
+  tree.replaceChildren(...nodes);
+}
+$('#filter').addEventListener('input', renderTables);
+$('#refresh').onclick = loadTables;
+
+// Query
+let running = false;
+async function run() {
+  const sql = currentSQL().trim();
+  if (!sql || running) return;
+  running = true;
+  $('#run').disabled = true;
+  $('#status').textContent = 'Running…';
+  const out = $('#result');
+  try {
+    const r = await api('/api/query', { sql });
+    renderResult(r);
+    $('#node').textContent = r.node;
+    $('#status').textContent = r.rows.length.toLocaleString() + (r.rows.length === 1 ? ' row' : ' rows') +
+      (r.truncated ? ' shown (result truncated; add a LIMIT)' : '') + ' · ' + r.elapsedMs.toFixed(1) + ' ms · ' + r.node;
+  } catch (e) {
+    out.replaceChildren(el('div', 'error', e.message));
+    $('#status').textContent = 'Query failed.';
+  } finally {
+    running = false;
+    $('#run').disabled = false;
+  }
+}
+function renderResult(r) {
+  const out = $('#result');
+  if (!r.columns.length) { out.replaceChildren(el('div', 'empty', 'The query returned no rows.')); return; }
+  const numeric = r.columns.map((c) => /^(u?int|float|decimal)/.test(c.type));
+  const table = el('table');
+  const head = el('tr');
+  head.append(el('th', 'rn', '#'));
+  r.columns.forEach((c, i) => {
+    const th = el('th', numeric[i] ? 'num' : '', c.name);
+    th.append(el('small', '', c.type));
+    head.append(th);
+  });
+  const thead = el('thead'); thead.append(head);
+  const tbody = el('tbody');
+  r.rows.forEach((row, n) => {
+    const tr = el('tr');
+    tr.append(el('td', 'rn', String(n + 1)));
+    row.forEach((v, i) => {
+      const td = v === null ? el('td', 'null', 'NULL') : el('td', numeric[i] ? 'num' : '', v);
+      if (v !== null && v.length > 40) td.title = v;
+      tr.append(td);
+    });
+    tbody.append(tr);
+  });
+  table.append(thead, tbody);
+  out.replaceChildren(table);
+}
+$('#run').onclick = run;
+
+// A small table: headers, then rows of cells. A cell is text, or { text, cls }.
+function miniTable(headers, rows) {
+  const table = el('table', 'mini');
+  const head = el('tr');
+  headers.forEach((h) => head.append(typeof h === 'string' ? el('th', '', h) : el('th', h.cls, h.text)));
+  table.append(head);
+  for (const row of rows) {
+    const tr = el('tr');
+    row.forEach((c) => tr.append(typeof c === 'string' ? el('td', '', c) : el('td', c.cls, c.text)));
+    table.append(tr);
+  }
+  return table;
+}
+const bytes = (n) => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2) + ' GB' : n >= 2 ** 20 ? (n / 2 ** 20).toFixed(1) + ' MB' : fmt(n / 1024) + ' KB';
+const share = (part, whole) => whole > 0 ? (100 * part / whole).toFixed(1) + '%' : '-';
+
+// Cluster overview: every node reports on itself. The server pushes it over a WebSocket twice a
+// second; without one, this polls.
+const clusterDlg = $('#cluster');
+let clusterTimer = null, clusterLive = false;
+function renderCluster(o) {
+  const up = o.nodes.filter((n) => n.ok);
+  const leader = up.find((n) => n.info.is_leader === 'true');
+  const col = o.tables ? Object.fromEntries(o.tables.columns.map((c, i) => [c.name, i])) : {};
+  const inMemory = o.tables ? o.tables.rows.reduce((sum, r) => sum + Number(r[col.buffered_rows]), 0) : 0;
+  const badge = $('#clusterBadge');
+  badge.textContent = up.length + '/' + o.nodes.length + ' nodes up · ' + (leader ? 'leader node ' + leader.info.node_id : 'no leader') +
+    (o.tables ? ' · ' + fmt(inMemory) + ' rows in memory' : '');
+  badge.className = up.length < o.nodes.length || !leader ? 'down' : '';
+  if (!clusterDlg.open) return;
+  const maxLog = Math.max(0, ...up.map((n) => Number(n.info.raft_last_log_index)));
+  $('#clusterNodes').replaceChildren(miniTable(
+    ['Address', 'Node', 'Role', 'Rows in memory', 'Buffer memory', 'Process memory', 'WAL on disk', 'Log index', 'Behind', 'Applied seq', 'Answered in'],
+    o.nodes.map((n) => n.ok ? [
+      n.addr, n.info.node_id,
+      n.info.is_leader === 'true' ? { text: 'leader', cls: 'lead' } : 'follower',
+      fmt(n.bufferedRows), bytes(Number(n.info.memory_used_bytes)), bytes(Number(n.info.process_memory_bytes || 0)), bytes(Number(n.info.wal_bytes || 0)),
+      fmt(Number(n.info.raft_last_log_index)), fmt(maxLog - Number(n.info.raft_last_log_index)),
+      fmt(Number(n.info.applied_seq)), n.latencyMs.toFixed(1) + ' ms',
+    ] : [n.addr, '-', { text: 'unreachable', cls: 'down' }, '-', '-', '-', '-', '-', '-', '-', { text: n.error || '', cls: 'left down' }])));
+  $('#clusterTablesTitle').textContent = 'Tables' + (o.tablesFrom ? ' (as seen by ' + o.tablesFrom + ')' : '');
+  $('#clusterNote').textContent = 'Rows are row versions: a key written twice counts twice. "Taking writes" is the active memtable, ' +
+    '"Waiting for Doris" is frozen and being loaded, "In grace" is visible in Doris and about to be dropped. ' +
+    '"Visible seq" and "Trimmed seq" are the replicated watermarks: the highest sequence visible in Doris, and dropped from the buffer. ' +
+    '"Load running" is how long the leader\'s current load into Doris has taken; it is given up and retried after the table\'s load timeout. ' +
+    '"Write delay" is added to every write to a table as it fills up (10 ms at 70% of its cap, doubling every 5%); reads are never delayed. ' +
+    '"Buffer memory" counts the buffered rows and their key index; it is what the caps apply to. "Process memory" is what the operating system reports for the whole process, which is always more. "Behind" is how many log entries a node lacks compared with the most advanced one. ' +
+    (clusterLive ? 'Live over WebSocket.' : 'Polling (no WebSocket).');
+  if (!o.tables) { $('#clusterTables').replaceChildren(el('div', 'empty', 'No node answered.')); return; }
+  $('#clusterTables').replaceChildren(o.tables.rows.length ? miniTable(
+    ['Table', 'Key', 'Rows in memory', 'Taking writes', 'Waiting for Doris', 'In grace', 'Grace', 'Memory / cap', 'Write delay', 'Load running', 'Visible seq', 'Trimmed seq', 'Flush failures', { text: 'State', cls: 'left' }],
+    o.tables.rows.map((r) => {
+      const problem = r[col.rejecting] || r[col.last_error];
+      const loading = Number(r[col.load_running_ms] || 0);
+      const delay = Number(r[col.write_delay_ms] || 0), held = r[col.writes_held] === 'true';
+      return [
+        r[col.db] + '.' + r[col.name], r[col.key_columns], fmt(Number(r[col.buffered_rows])), fmt(Number(r[col.active_rows])),
+        fmt(Number(r[col.unflushed_rows])), fmt(Number(r[col.grace_rows])),
+        col.grace_ms === undefined ? '-' : (Number(r[col.grace_ms]) >= 1000 ? Number(r[col.grace_ms]) / 1000 + ' s' : r[col.grace_ms] + ' ms'),
+        bytes(Number(r[col.buffered_bytes])) + (col.memory_cap_bytes === undefined ? '' : ' / ' + bytes(Number(r[col.memory_cap_bytes]))),
+        held ? { text: 'held', cls: 'down' } : delay ? (delay >= 1000 ? (delay / 1000).toFixed(2) + ' s' : delay + ' ms') : '-',
+        loading ? { text: (loading / 1000).toFixed(1) + ' s', cls: loading > 30000 ? 'down' : '' } : '-',
+        fmt(Number(r[col.visible_seq] || 0)), fmt(Number(r[col.trimmed_seq] || 0)),
+        r[col.consecutive_failures], problem ? { text: problem, cls: 'left down' } : { text: 'ok', cls: 'left' },
+      ];
+    })) : el('div', 'empty', 'No tables are attached.'));
+}
+async function pollCluster() {
+  clearTimeout(clusterTimer);
+  if (clusterLive) return;
+  try { renderCluster(await api('/api/cluster')); }
+  catch (e) { $('#clusterBadge').textContent = 'Cluster: ' + e.message; $('#clusterBadge').className = 'down'; }
+  clusterTimer = setTimeout(pollCluster, 2000);
+}
+function connectCluster() {
+  let ws;
+  try { ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/cluster/ws'); }
+  catch { pollCluster(); return; }
+  ws.onopen = () => { clusterLive = true; clearTimeout(clusterTimer); };
+  ws.onmessage = (m) => { try { renderCluster(JSON.parse(m.data)); } catch {} };
+  ws.onclose = () => { clusterLive = false; pollCluster(); setTimeout(connectCluster, 3000); };
+}
+const openCluster = () => { clusterDlg.showModal(); if (!clusterLive) pollCluster(); };
+$('#clusterBadge').onclick = openCluster;
+$('#clusterBadge').onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCluster(); } };
+$('#clusterClose').onclick = () => clusterDlg.close();
+
+// Bulk insert: the server runs the job; this polls its progress.
+const dlg = $('#bulk');
+const fmt = (n) => Math.round(n).toLocaleString();
+const rate = (r) => r >= 1e6 ? (r / 1e6).toFixed(2) + ' M rows/s' : fmt(r) + ' rows/s';
+const secs = (ms) => ms < 60000 ? (ms / 1000).toFixed(1) + ' s' : Math.floor(ms / 60000) + ' min ' + Math.round(ms % 60000 / 1000) + ' s';
+let bulkTimer = null, bulkLast = null;
+function renderBulk(st) {
+  const running = st.state === 'running';
+  const pct = st.total ? 100 * st.done / st.total : 0;
+  $('#bulkBar').className = 'bar' + (st.state === 'failed' ? ' failed' : '');
+  $('#bulkBar').firstElementChild.style.width = pct + '%';
+  $('#bulkCancel').hidden = !running;
+  $('#bulkStartBtn').disabled = running;
+  const text = $('#bulkText');
+  text.className = st.state === 'failed' ? 'bad' : '';
+  if (st.state === 'idle') { text.textContent = 'No bulk insert has run yet.'; $('#bulkBadge').textContent = ''; return; }
+  const average = st.elapsedMs > 0 ? st.done / (st.elapsedMs / 1000) : 0;
+  let line = fmt(st.done) + ' / ' + fmt(st.total) + ' rows (' + pct.toFixed(1) + '%) into ' + st.table +
+    (st.rate ? ' · limit ' + fmt(st.rate) + ' rows/s' : ' · no rate limit');
+  if (running) {
+    // Speed over the last poll interval; the average is shown once the job ends.
+    let now = average;
+    if (bulkLast && st.elapsedMs > bulkLast.elapsedMs) now = (st.done - bulkLast.done) / ((st.elapsedMs - bulkLast.elapsedMs) / 1000);
+    line += '\n' + rate(now) + ' now · ' + secs(st.elapsedMs) + ' elapsed';
+    if (average > 0) line += ' · about ' + secs((st.total - st.done) / average * 1000) + ' left';
+    $('#bulkBadge').textContent = 'Bulk insert ' + pct.toFixed(0) + '%';
+  } else {
+    const word = { done: 'Done', cancelled: 'Cancelled', failed: 'Failed' }[st.state] || st.state;
+    line += '\n' + word + ' after ' + secs(st.elapsedMs) + ' · ' + rate(average) + ' on average';
+    if (st.error) line += '\n' + st.error;
+    $('#bulkBadge').textContent = st.state === 'done' ? '' : 'Bulk insert ' + word.toLowerCase();
+  }
+  if (st.waits) line += '\nWaited ' + fmt(st.waits) + (st.waits === 1 ? ' time' : ' times') + ' for buffer space while the cluster loaded into Doris';
+  text.textContent = line;
+  // Per node: the speed over the last poll while running, the average afterwards.
+  const span = bulkLast && running ? (st.elapsedMs - bulkLast.elapsedMs) / 1000 : 0;
+  $('#bulkNodes').replaceChildren(miniTable(['Node', 'Rows', 'Share', running ? 'Rows/s now' : 'Rows/s average'],
+    st.nodes.map((n, i) => [
+      n.addr, fmt(n.rows), share(n.rows, st.done),
+      fmt(span > 0 ? (n.rows - bulkLast.nodes[i].rows) / span : st.elapsedMs > 0 ? n.rows / (st.elapsedMs / 1000) : 0),
+    ])));
+  bulkLast = st;
+}
+async function pollBulk() {
+  clearTimeout(bulkTimer);
+  try {
+    const st = await api('/api/bulk');
+    renderBulk(st);
+    if (st.state === 'running') bulkTimer = setTimeout(pollBulk, 500);
+  } catch (e) {
+    $('#bulkText').className = 'bad';
+    $('#bulkText').textContent = e.message;
+  }
+}
+$('#bulkOpen').onclick = $('#bulkBadge').onclick = () => {
+  const sel = $('#bulkTable'), keep = sel.value;
+  sel.replaceChildren(...tables.map((t) => el('option', '', t.db + '.' + t.name)));
+  if (keep) sel.value = keep;
+  dlg.showModal();
+  pollBulk();
+};
+$('#bulkClose').onclick = () => dlg.close();
+$('#bulkCancel').onclick = async () => { try { await api('/api/bulk', undefined, 'DELETE'); } catch {} pollBulk(); };
+$('#bulkStartBtn').onclick = async () => {
+  const num = (id) => Number($(id).value);
+  const text = $('#bulkText');
+  try {
+    bulkLast = null;
+    renderBulk(await api('/api/bulk', {
+      table: $('#bulkTable').value, rows: num('#bulkRows'), startId: num('#bulkStart'),
+      batch: num('#bulkBatch'), writers: num('#bulkWriters'), rate: num('#bulkRate'),
+    }));
+    pollBulk();
+  } catch (e) {
+    text.className = 'bad';
+    text.textContent = e.message;
+  }
+};
+
+// Bulk query: the same pattern, for parallel point lookups.
+const bqDlg = $('#bq');
+const qps = (r) => fmt(r) + ' queries/s';
+let bqTimer = null, bqLast = null;
+function renderBq(st) {
+  const running = st.state === 'running';
+  const pct = st.state === 'done' ? 100 : st.seconds ? Math.min(100, st.elapsedMs / (st.seconds * 10)) : 0;
+  $('#bqBar').className = 'bar' + (st.state === 'failed' ? ' failed' : '');
+  $('#bqBar').firstElementChild.style.width = pct + '%';
+  $('#bqCancel').hidden = !running;
+  $('#bqStartBtn').disabled = running;
+  const text = $('#bqText');
+  text.className = st.state === 'failed' ? 'bad' : '';
+  if (st.state === 'idle') { text.textContent = 'No bulk query has run yet.'; $('#bqBadge').textContent = ''; return; }
+  const average = st.elapsedMs > 0 ? st.queries / (st.elapsedMs / 1000) : 0;
+  const missed = st.queries - st.found;
+  let line = fmt(st.queries) + ' queries on ' + st.table + ' · ' + st.clients + ' clients';
+  if (running) {
+    // Speed over the last poll interval; the average is shown once the job ends.
+    let now = average;
+    if (bqLast && st.elapsedMs > bqLast.elapsedMs) now = (st.queries - bqLast.queries) / ((st.elapsedMs - bqLast.elapsedMs) / 1000);
+    line += '\n' + qps(now) + ' now · ' + secs(st.elapsedMs) + ' of ' + st.seconds + ' s';
+    $('#bqBadge').textContent = 'Bulk query ' + qps(now);
+  } else {
+    const word = { done: 'Done', cancelled: 'Stopped', failed: 'Failed' }[st.state] || st.state;
+    line += '\n' + word + ' after ' + secs(st.elapsedMs) + ' · ' + qps(average) + ' on average';
+    $('#bqBadge').textContent = st.state === 'failed' ? 'Bulk query failed' : '';
+  }
+  line += '\nLatency p50 ' + st.p50Ms.toFixed(2) + ' ms · p99 ' + st.p99Ms.toFixed(2) + ' ms';
+  line += '\n' + fmt(missed) + (missed === 1 ? ' id' : ' ids') + ' not found · ' + fmt(st.errors) + (st.errors === 1 ? ' error' : ' errors');
+  if (st.error) line += '\n' + st.error;
+  text.textContent = line;
+  const span = bqLast && running ? (st.elapsedMs - bqLast.elapsedMs) / 1000 : 0;
+  $('#bqNodes').replaceChildren(miniTable(['Node', 'Queries', 'Share', running ? 'Queries/s now' : 'Queries/s average', 'p50', 'p99', 'Errors'],
+    st.nodes.map((n, i) => [
+      n.addr, fmt(n.queries), share(n.queries, st.queries),
+      fmt(span > 0 ? (n.queries - bqLast.nodes[i].queries) / span : st.elapsedMs > 0 ? n.queries / (st.elapsedMs / 1000) : 0),
+      n.p50Ms.toFixed(2) + ' ms', n.p99Ms.toFixed(2) + ' ms', { text: fmt(n.errors), cls: n.errors ? 'down' : '' },
+    ])));
+  bqLast = st;
+}
+async function pollBq() {
+  clearTimeout(bqTimer);
+  try {
+    const st = await api('/api/bulkquery');
+    renderBq(st);
+    if (st.state === 'running') bqTimer = setTimeout(pollBq, 500);
+  } catch (e) {
+    $('#bqText').className = 'bad';
+    $('#bqText').textContent = e.message;
+  }
+}
+$('#bqOpen').onclick = $('#bqBadge').onclick = () => {
+  const sel = $('#bqTable'), keep = sel.value;
+  sel.replaceChildren(...tables.map((t) => el('option', '', t.db + '.' + t.name)));
+  if (keep) sel.value = keep;
+  bqDlg.showModal();
+  pollBq();
+};
+$('#bqClose').onclick = () => bqDlg.close();
+$('#bqCancel').onclick = async () => { try { await api('/api/bulkquery', undefined, 'DELETE'); } catch {} pollBq(); };
+$('#bqStartBtn').onclick = async () => {
+  const num = (id) => Number($(id).value);
+  try {
+    bqLast = null;
+    renderBq(await api('/api/bulkquery', {
+      table: $('#bqTable').value, startId: num('#bqStart'), ids: num('#bqIds'),
+      clients: num('#bqClients'), seconds: num('#bqSeconds'),
+    }));
+    pollBq();
+  } catch (e) {
+    $('#bqText').className = 'bad';
+    $('#bqText').textContent = e.message;
+  }
+};
+loadTables();
+pollBulk();
+pollBq();
+connectCluster();
+</script>
+</body>
+</html>

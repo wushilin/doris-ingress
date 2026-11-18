@@ -201,3 +201,36 @@ async fn broker_load_statement() {
         assert!(sql.contains(part), "missing {part:?} in\n{sql}");
     }
 }
+
+/// The SDK loader in dry run: the whole flush path runs (unit, CSV rows, SDK batching, trim), but
+/// nothing leaves the process; each upload is acknowledged after the configured delay.
+#[tokio::test(flavor = "multi_thread")]
+async fn sdk_loader_dry_run_acknowledges_after_the_delay_without_a_doris() {
+    use doris_ingress::loader::{Loader, SdkLoadConfig, SdkLoader};
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let mut sdk = SdkLoadConfig::new(StreamLoadConfig {
+        fe_url: "http://127.0.0.1:1".into(), // nothing listens here, and nothing is asked
+        be_url: None,
+        user: "u".into(),
+        password: "p".into(),
+        timeout: Duration::from_secs(30),
+    });
+    sdk.dry_run = true;
+    sdk.dry_run_delay = Duration::from_millis(500);
+    let mut loaders: HashMap<String, Arc<dyn Loader>> = HashMap::new();
+    loaders.insert("stream_sdk".into(), Arc::new(SdkLoader::new(sdk).unwrap()));
+    let e = doris_ingress::Node::start(node_config(1, &addr, dir.path()), loaders).await.unwrap();
+    e.initialize(vec![(1, addr)]).await.unwrap();
+    wait_leader(&e, 1).await;
+    let table = doris_ingress::TableConfig { grace: Duration::from_millis(50), ..fast_config() };
+    e.attach(table_def(table), "stream_sdk", 1).await.unwrap();
+
+    e.upsert("db.t", rows(&[(1, "a"), (2, "b,\"c\""), (3, "d")])).await.unwrap();
+    let started = std::time::Instant::now();
+    e.flush("db.t", Duration::from_secs(10)).await.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500), "{:?}", started.elapsed());
+    wait_for("trim", Duration::from_secs(5), || e.stats("db.t").unwrap().trimmed_seq == 3).await;
+    assert_eq!(e.stats("db.t").unwrap().consecutive_failures, 0);
+    e.shutdown().await;
+}

@@ -26,13 +26,13 @@ use parquet::file::properties::WriterProperties;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, TableConfig};
 use crate::error::{Error, Result};
 use crate::loader::{LoadState, LoadUnit, Loader, make_label};
 use crate::memtable::{Memtable, Selected, emit, materialize, select_latest};
 use crate::raft::log_store::{LogStore, RetentionFloor};
 use crate::raft::network::{NetworkFactory, router};
-use crate::raft::state_machine::{SmCore, StateMachine, TableSm, UnitState};
+use crate::raft::state_machine::{SmCore, StateMachine, TableSm, UnitState, WRITE_HOLD};
 use crate::raft::{BasicNode, NodeId, Raft, Request, Response, WriteOpWire};
 use crate::schema::TableDef;
 use crate::wal::{Recovery, Wal, WalOptions};
@@ -71,7 +71,26 @@ pub struct ScanOptions {
 #[derive(Clone, Debug)]
 pub struct TableStats {
     pub buffered_bytes: usize,
+    /// Row versions in the memtable that is taking writes.
     pub active_rows: usize,
+    /// Row versions in frozen units that are not yet visible in Doris.
+    pub unflushed_rows: usize,
+    /// Row versions in units that are visible in Doris and kept for the grace period.
+    pub grace_rows: usize,
+    /// The table's memory cap and grace period, as currently set.
+    pub memory_cap_bytes: usize,
+    pub grace: Duration,
+    /// Delay now applied to every write to this table (zero when there is room).
+    pub write_delay: Duration,
+    /// Writes are held until Doris frees space.
+    pub writes_held: bool,
+    /// How long the load now in flight has been running. Only the leader loads.
+    pub load_running: Option<Duration>,
+    /// Highest sequence number known to be visible in Doris. The same on every node at the same
+    /// point in the Raft log, and kept across restarts.
+    pub visible_seq: u64,
+    /// Highest sequence number trimmed from the buffer: rows up to it are only in Doris.
+    pub trimmed_seq: u64,
     /// Frozen units not yet visible in Doris.
     pub unflushed_units: usize,
     /// Units visible in Doris and kept for the grace period.
@@ -109,6 +128,13 @@ struct Inner {
     health: Mutex<HashMap<String, FlushHealth>>,
     /// Leader-local: when this node first saw each unit visible (grace timer start).
     visible_seen: Mutex<HashMap<(String, u64), Instant>>,
+    /// Followers this node is sending a snapshot to right now.
+    sending_snapshots: crate::raft::network::SnapshotsInFlight,
+    peer_faults: crate::raft::network::PeerFaults,
+    /// Oldest log entry a buffered row still refers to (0: not known yet).
+    retention_floor: RetentionFloor,
+    /// Per table: when the load now in flight was started on this node.
+    load_started: Mutex<HashMap<String, Instant>>,
     load_slots: Arc<Semaphore>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     recovery: Recovery,
@@ -139,6 +165,7 @@ impl Node {
         }
         let wal = Arc::new(wal);
         let floor = RetentionFloor::default();
+        let retention_floor = floor.clone();
         let log = LogStore::open(wal.clone(), floor.clone())?;
         let sm = SmCore::open(wal.clone(), cfg.data_dir.join("snapshots"), floor, &cfg.memory)?;
 
@@ -148,19 +175,25 @@ impl Node {
             election_timeout_min: cfg.raft.election_timeout_min.as_millis() as u64,
             election_timeout_max: cfg.raft.election_timeout_max.as_millis() as u64,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(cfg.raft.snapshot_every_entries),
-            max_in_snapshot_log_to_keep: 0,
+            // Never purged by openraft on its own: `run_log_purger` decides, so that the log a
+            // follower is catching up on is not purged under it.
+            max_in_snapshot_log_to_keep: u64::MAX,
             // Entries can be several MB (group-committed Arrow batches): bound each AppendEntries.
             max_payload_entries: 16,
             ..Default::default()
         }
         .validate()
         .map_err(|e| Error::Raft(e.to_string()))?;
-        let raft = Raft::new(cfg.id, Arc::new(raft_cfg), NetworkFactory::default(), log, StateMachine { core: sm.clone() })
+        let mut network = NetworkFactory::default();
+        network.snapshot_rate = cfg.raft.snapshot_send_bytes_per_sec;
+        let sending_snapshots = network.sending.clone();
+        let peer_faults = network.faults.clone();
+        let raft = Raft::new(cfg.id, Arc::new(raft_cfg), network, log, StateMachine { core: sm.clone() })
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
 
         let listener = tokio::net::TcpListener::bind(&cfg.raft_listen).await?;
-        let raft_routes = router(cfg.id, raft.clone());
+        let raft_routes = router(cfg.id, raft.clone(), cfg.data_dir.join("snapshots"));
 
         let (batch_tx, batch_rx) = mpsc::channel(4096);
         let (read_index_tx, read_index_rx) = mpsc::channel(65_536);
@@ -175,6 +208,10 @@ impl Node {
             batch_tx,
             health: Mutex::default(),
             visible_seen: Mutex::default(),
+            load_started: Mutex::default(),
+            sending_snapshots,
+            peer_faults,
+            retention_floor,
             tasks: Mutex::default(),
             recovery,
             read_index_tx,
@@ -195,7 +232,10 @@ impl Node {
         let forwarder = tokio::spawn(run_forward_batcher(inner.clone(), forward_rx));
         let watcher = tokio::spawn(run_leader_watcher(Arc::downgrade(&inner)));
         let flusher = tokio::spawn(run_flush_supervisor(Arc::downgrade(&inner)));
-        inner.tasks.lock().extend([server, batcher, flusher, read_indexer, forwarder, watcher]);
+        let trimmer = tokio::spawn(run_wal_trimmer(Arc::downgrade(&inner)));
+        let pacer = tokio::spawn(run_backpressure_monitor(Arc::downgrade(&inner)));
+        let purger = tokio::spawn(run_log_purger(Arc::downgrade(&inner)));
+        inner.tasks.lock().extend([server, batcher, flusher, trimmer, pacer, purger, read_indexer, forwarder, watcher]);
         Ok(Self { inner })
     }
 
@@ -246,6 +286,26 @@ impl Node {
         use std::sync::atomic::Ordering::Relaxed;
         let sm = &self.inner.sm;
         (sm.apply_nanos.load(Relaxed), sm.apply_entries.load(Relaxed), sm.apply_ops.load(Relaxed))
+    }
+
+    /// Index up to which this node's Raft log has been purged (0: nothing purged yet).
+    pub fn raft_purged_index(&self) -> u64 {
+        self.inner.raft.metrics().borrow_watched().purged.map_or(0, |id| id.index)
+    }
+
+    /// Injects (or with `None` removes) a fault in this node's replication to `target`. For tests.
+    #[doc(hidden)]
+    pub fn inject_peer_fault(&self, target: NodeId, fault: Option<crate::raft::network::PeerFault>) {
+        let mut faults = self.inner.peer_faults.lock();
+        match fault {
+            Some(f) => faults.insert(target, f),
+            None => faults.remove(&target),
+        };
+    }
+
+    /// How many snapshots this node has installed from a leader since it started.
+    pub fn snapshots_installed(&self) -> u64 {
+        self.inner.sm.snapshots_installed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Index of the last entry in this node's Raft log.
@@ -432,6 +492,22 @@ impl Node {
         self.inner.sm.tables().iter().map(|t| t.def.clone()).collect()
     }
 
+    /// The table's current settings. They can differ from `tables()[..].config`, which is what
+    /// the table was attached with.
+    pub fn table_config(&self, table: &str) -> Result<TableConfig> {
+        Ok(self.inner.table(table)?.config())
+    }
+
+    /// Replaces the table's settings on every node (leader only). It is a Raft entry: all nodes
+    /// switch at the same point in the log, and the change survives restarts.
+    pub async fn set_table_config(&self, table: &str, config: TableConfig) -> Result<()> {
+        match self.inner.propose(Request::SetTableConfig { table: table.into(), config: Box::new(config) }).await? {
+            Response::Ok => Ok(()),
+            Response::Rejected(r) => Err(Error::UnknownTable(r)),
+            other => Err(Error::Raft(format!("unexpected response {other:?}"))),
+        }
+    }
+
     /// Freezes everything buffered for the table and waits until it is visible in Doris
     /// (leader only).
     pub async fn flush(&self, table: &str, timeout: Duration) -> Result<()> {
@@ -462,13 +538,38 @@ impl Node {
         let u = t.units.lock();
         Ok(TableStats {
             buffered_bytes: u.bytes,
+            visible_seq: u.visible_seq,
+            trimmed_seq: u.trimmed_seq,
+            memory_cap_bytes: t.config().memory_cap_bytes,
+            grace: t.config().grace,
+            load_running: self.inner.load_started.lock().get(table).map(|t| t.elapsed()),
+            write_delay: match t.write_delay_us.load(std::sync::atomic::Ordering::Relaxed) {
+                WRITE_HOLD => Duration::ZERO,
+                micros => Duration::from_micros(micros),
+            },
+            writes_held: t.write_delay_us.load(std::sync::atomic::Ordering::Relaxed) == WRITE_HOLD,
             active_rows: u.active.rows(),
+            unflushed_rows: u.frozen.iter().filter(|x| x.state != UnitState::Visible).map(|x| x.mem.rows()).sum(),
+            grace_rows: u.frozen.iter().filter(|x| x.state == UnitState::Visible).map(|x| x.mem.rows()).sum(),
             unflushed_units: u.frozen.iter().filter(|x| x.state != UnitState::Visible).count(),
             grace_units: u.frozen.iter().filter(|x| x.state == UnitState::Visible).count(),
             consecutive_failures: h.failures,
             last_error: h.last_error,
             rejecting,
         })
+    }
+
+    /// Physical memory this process uses, as the operating system reports it (0 where that is
+    /// not available). It is more than [`Node::memory_used`]: that counts only buffered rows and
+    /// their index, not the allocator's overhead, queries in flight, or the files the leader
+    /// builds for a load.
+    pub fn process_memory(&self) -> u64 {
+        process_memory_bytes()
+    }
+
+    /// Bytes of WAL segment files on this node's disk.
+    pub fn wal_bytes(&self) -> u64 {
+        self.inner.wal_bytes()
     }
 
     /// Bytes buffered across all tables on this node.
@@ -616,15 +717,41 @@ fn internal_router(inner: Arc<Inner>) -> axum::Router {
 }
 
 impl Inner {
-    /// Leader write path: stuck-table check, memory admission, then group commit.
+    fn wal_bytes(&self) -> u64 {
+        let Ok(dir) = std::fs::read_dir(self.cfg.data_dir.join("wal")) else { return 0 };
+        dir.filter_map(|e| e.ok()?.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+    }
+
+    /// Bytes of whole WAL files that hold only entries after `after` and up to `upto`: what a
+    /// purge to `upto` would free if nothing held the log at `after`. Files are named by the
+    /// index of their first entry, and a file ends where the next begins.
+    fn wal_bytes_between(&self, after: u64, upto: u64) -> u64 {
+        let Ok(dir) = std::fs::read_dir(self.cfg.data_dir.join("wal")) else { return 0 };
+        let mut files: Vec<(u64, u64)> = dir
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let first = e.file_name().to_str()?.strip_suffix(".wal")?.parse::<u64>().ok()?;
+                Some((first, e.metadata().ok()?.len()))
+            })
+            .collect();
+        files.sort_unstable();
+        files.windows(2).filter(|w| w[0].0 > after && w[1].0 - 1 <= upto).map(|w| w[0].1).sum()
+    }
+
+    /// Leader write path: stuck-table check, memory admission (per table, then for the node),
+    /// then group commit.
     async fn submit(&self, wire: Vec<WriteOpWire>) -> Result<WriteAck> {
         let bytes = wire.iter().map(|o| o.ipc.len()).sum();
         let touched: HashSet<&str> = wire.iter().map(|o| o.table.as_str()).collect();
+        let mut tables = Vec::with_capacity(touched.len());
         for name in touched {
-            if let Some(reason) = self.rejecting(&*self.table(name)?) {
+            let t = self.table(name)?;
+            if let Some(reason) = self.stuck(&t) {
                 return Err(Error::TableStuck { table: name.to_string(), reason });
             }
+            tables.push(t);
         }
+        self.pace(&tables).await?;
         self.sm.governor.admit().await?;
         let t0 = Instant::now();
         let r = self.submit_inner(wire, bytes).await;
@@ -787,18 +914,48 @@ impl Inner {
         self.raft.client_write(req).await.map(|r| r.data).map_err(map_write_err)
     }
 
-    fn rejecting(&self, t: &TableSm) -> Option<String> {
-        let cfg = &t.def.config;
+    /// Why the table refuses writes outright: its loads keep failing, so waiting would not help.
+    fn stuck(&self, t: &TableSm) -> Option<String> {
+        let cfg = t.config();
         if let Some(h) = self.health.lock().get(&t.def.full_name())
             && h.failures >= cfg.max_flush_failures
         {
             return Some(format!("{} consecutive flush failures, last: {}", h.failures, h.last_error.as_deref().unwrap_or("?")));
         }
-        let bytes = t.units.lock().bytes;
-        if bytes >= cfg.memory_cap_bytes {
-            return Some(format!("buffered {bytes} bytes, table cap is {}", cfg.memory_cap_bytes));
-        }
         None
+    }
+
+    /// Why writers to the table are refused or held, for status output.
+    fn rejecting(&self, t: &TableSm) -> Option<String> {
+        if let Some(reason) = self.stuck(t) {
+            return Some(reason);
+        }
+        (t.write_delay_us.load(std::sync::atomic::Ordering::Relaxed) == WRITE_HOLD).then(|| {
+            format!("buffer full ({} bytes, the cap is {}): writes are held until Doris frees space", t.units.lock().bytes, t.config().memory_cap_bytes)
+        })
+    }
+
+    /// Backpressure for one write. It costs one atomic read per table: the delay is worked out
+    /// by [`run_backpressure_monitor`], not here. A write is delayed more the fuller its tables
+    /// (or the node) are, and held when a table is at its limit. A write held longer than
+    /// `max_admission_wait` gets the retryable `Backpressure` error. Reads never come here.
+    async fn pace(&self, tables: &[Arc<TableSm>]) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let delay = |tables: &[Arc<TableSm>]| tables.iter().map(|t| t.write_delay_us.load(Relaxed)).max().unwrap_or(0);
+        // The published value is re-read while waiting, so a write stops waiting as soon as space
+        // is freed, and starts being held if the table reaches its limit meanwhile.
+        let start = Instant::now();
+        loop {
+            let waited = start.elapsed();
+            let nap = match delay(tables) {
+                0 => return Ok(()),
+                WRITE_HOLD if waited >= self.cfg.memory.max_admission_wait => return Err(Error::Backpressure { waited }),
+                WRITE_HOLD => Duration::from_millis(20),
+                micros if waited >= Duration::from_micros(micros) => return Ok(()),
+                micros => (Duration::from_micros(micros) - waited).min(Duration::from_millis(50)),
+            };
+            tokio::time::sleep(nap).await;
+        }
     }
 
     fn record_failure(&self, table: &str, msg: String) {
@@ -982,6 +1139,232 @@ async fn run_batcher(inner: Arc<Inner>, mut rx: mpsc::Receiver<Pending>) {
     }
 }
 
+/// The backpressure monitor. Every 100 ms it looks at how full each table and the node are and
+/// publishes the delay writes to each table should take (see [`crate::memory::write_delay`]), so
+/// that a write only has to read one number. A table at [`crate::memory::HOLD_AT`] times its cap
+/// gets [`WRITE_HOLD`]. Runs on every node; only the leader's values are used.
+async fn run_backpressure_monitor(inner: std::sync::Weak<Inner>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Some(node) = inner.upgrade() else { break };
+        let node_full = node.sm.governor.utilization();
+        for t in node.sm.tables() {
+            let cap = t.config().memory_cap_bytes;
+            let bytes = t.units.lock().bytes;
+            let table_full = if cap == 0 { f64::INFINITY } else { bytes as f64 / cap as f64 };
+            let delay = if table_full >= crate::memory::HOLD_AT {
+                WRITE_HOLD
+            } else {
+                // At the node's own target the governor holds writes, exactly; up to there the
+                // node's fill level slows writes down like a table's does.
+                crate::memory::write_delay(table_full.max(node_full.min(0.9999)), &node.cfg.memory).as_micros() as u64
+            };
+            t.write_delay_us.store(delay, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_memory_bytes() -> u64 {
+    // The physical footprint: what Activity Monitor shows, compressed memory included.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t) };
+    if ok == 0 { info.ri_phys_footprint } else { 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_bytes() -> u64 {
+    // Resident pages, the second field of /proc/self/statm.
+    let pages = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok());
+    pages.map_or(0, |p| p * unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_memory_bytes() -> u64 {
+    0
+}
+
+/// A follower's hold on the leader's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CatchUpCursor {
+    /// The leader keeps every entry after this index for the follower.
+    position: u64,
+    /// The leader's purge point when the cursor was created. The cursor never needs anything at
+    /// or before it, so a purge that has already happened cannot invalidate it.
+    epoch: u64,
+    /// Whether the follower has reported how far its log goes. Until it has (right after this
+    /// node became leader, or the follower joined), nothing more is purged on its account.
+    known: bool,
+    /// The position is the index of a snapshot sent to the follower, which it has not reached
+    /// yet. It stays there, whatever else is sent, until the follower gets that far.
+    pinned: bool,
+}
+
+impl CatchUpCursor {
+    /// The cursor after one look at a follower.
+    /// * `matched`: the last entry it is known to hold (`None`: not reported yet).
+    /// * `purged`: the leader's purge point, counting purges already asked for.
+    /// * `sent`: the log index of the last snapshot the leader started sending it, if any.
+    fn advance(current: Option<Self>, matched: Option<u64>, purged: u64, sent: Option<u64>) -> Self {
+        let Some(matched) = matched else {
+            // Progress unknown: hold everything that is still there.
+            return current.unwrap_or(Self { position: purged, epoch: purged, known: false, pinned: false });
+        };
+        let (mut position, mut pinned) = match current {
+            Some(c) if c.known => (c.position, c.pinned),
+            // First report. With everything after the purge point, hold from where it is.
+            // Otherwise it needs a snapshot: hold everything until one is on its way.
+            _ if matched >= purged => (matched, false),
+            _ => (purged, false),
+        };
+        if matched >= position {
+            // It has everything up to the hold: follow it forward.
+            (position, pinned) = (matched, false);
+        } else if !pinned && let Some(s) = sent.filter(|s| *s > matched) {
+            // A snapshot is on its way: hold from exactly its index, so that the follower can
+            // continue from the log once it is installed. A later snapshot sent before the
+            // follower gets there does not move the hold: whichever one it installs, the log
+            // after it is still there.
+            (position, pinned) = (position.max(s), true);
+        }
+        Self { position, epoch: current.map_or(purged, |c| c.epoch), known: true, pinned }
+    }
+}
+
+/// Decides how far the Raft log may be purged. openraft never purges on its own here.
+///
+/// A node that is not leader purges everything its latest snapshot covers. A leader also keeps
+/// what its followers still need, through one cursor per follower:
+/// * A follower that has everything after the purge point holds the log from the last entry it
+///   has. Its cursor moves forward as it replicates.
+/// * A follower that needs a snapshot holds everything until a snapshot is on its way to it,
+///   and from then on holds the log from exactly that snapshot's index (recorded by the network
+///   layer before the send starts). When the install finishes it continues from the log instead
+///   of needing yet another snapshot.
+/// * A follower counts as active while it acknowledges heartbeats or is being sent a snapshot.
+/// * A follower that has not reported its progress yet (this node has just become leader, or
+///   the follower has just joined) holds everything, so that nothing is purged between deciding
+///   that it needs no snapshot and its first read.
+/// * A cursor is dropped when its follower has been silent for `catch_up_idle`, or, starting
+///   with the follower furthest behind, when the WAL kept only for followers exceeds
+///   `catch_up_hold_bytes`.
+///   A follower without a cursor is simply sent a snapshot when the entries it needs are gone.
+///
+/// Cursors live in the leader's memory. A new leader starts with none and creates its own.
+async fn run_log_purger(inner: std::sync::Weak<Inner>) {
+    let mut cursors: HashMap<NodeId, CatchUpCursor> = HashMap::new();
+    // Per follower: its last acknowledgement as reported by openraft, and when that last changed.
+    let mut heard: HashMap<NodeId, (String, Instant)> = HashMap::new();
+    // The furthest purge this task has asked for. openraft carries a purge out a little later,
+    // so its reported purge point can still be behind this.
+    let mut requested = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Some(node) = inner.upgrade() else { break };
+        let m = node.raft.metrics().borrow_watched().clone();
+        let Some(snapshot) = m.snapshot.map(|id| id.index) else { continue };
+        // Deciding whether a follower can be served from the log and purging are both done here,
+        // and nowhere else, against the same purge point: everything already asked for counts as
+        // purged. So the decision ("it has what it needs: hold from there" or "it needs a
+        // snapshot") cannot be undone by a purge that was already on its way.
+        let purged = m.purged.map_or(0, |id| id.index).max(requested);
+        let mut target = snapshot;
+        let mut over_budget: Option<NodeId> = None;
+
+        match (&m.replication, node.is_leader()) {
+            (Some(replication), true) => {
+                let now = Instant::now();
+                for (&id, matched) in replication.iter().filter(|(id, _)| **id != node.cfg.id) {
+                    let ack = m.heartbeat.as_ref().and_then(|h| h.get(&id)).map(|t| format!("{t:?}")).unwrap_or_default();
+                    let seen = heard.entry(id).or_insert_with(|| (ack.clone(), now));
+                    // Active: it acknowledged something since the last look, or it is being sent a
+                    // snapshot (a follower does not acknowledge while it installs one).
+                    let (sending, sent) = {
+                        let sends = node.sending_snapshots.lock();
+                        (sends.in_flight.contains_key(&id), sends.last_index.get(&id).copied())
+                    };
+                    if seen.0 != ack || sending {
+                        *seen = (ack, now);
+                    }
+                    if seen.1.elapsed() > node.cfg.raft.catch_up_idle {
+                        if let Some(c) = cursors.remove(&id) {
+                            tracing::info!(follower = id, position = c.position, "catch-up cursor dropped: the follower is silent");
+                            node.sending_snapshots.lock().last_index.remove(&id);
+                        }
+                        continue;
+                    }
+                    let matched = matched.as_ref().map(|l| l.index);
+                    let before = cursors.get(&id).copied();
+                    let cursor = CatchUpCursor::advance(before, matched, purged, sent);
+                    if before.is_none_or(|b| b.position != cursor.position) && sent == Some(cursor.position) && matched.is_some_and(|m| m < cursor.position) {
+                        tracing::info!(follower = id, position = cursor.position, epoch = cursor.epoch, "catch-up cursor pinned at the snapshot being sent to the follower");
+                    }
+                    debug_assert!(cursor.position >= cursor.epoch);
+                    cursors.insert(id, cursor);
+                }
+                // A voter this leader has no replication state for yet holds everything too.
+                let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().filter(|id| *id != node.cfg.id).collect();
+                for id in voters {
+                    if !replication.contains_key(&id) && heard.entry(id).or_insert_with(|| (String::new(), now)).1.elapsed() <= node.cfg.raft.catch_up_idle {
+                        cursors.entry(id).or_insert(CatchUpCursor::advance(None, None, purged, None));
+                    }
+                }
+                cursors.retain(|id, c| replication.contains_key(id) || !c.known);
+                // Over budget: the follower furthest behind loses its hold. What counts is the WAL
+                // kept only for followers: files a purge would free, which neither the snapshot
+                // nor a buffered row still needs.
+                let floor = node.retention_floor.get();
+                let freeable = if floor == 0 { 0 } else { snapshot.min(floor - 1) };
+                if let Some((&id, c)) = cursors.iter().min_by_key(|(_, c)| c.position)
+                    && c.position < freeable
+                    && node.wal_bytes_between(c.position, freeable) > node.cfg.raft.catch_up_hold_bytes
+                {
+                    tracing::warn!(follower = id, position = c.position, "catch-up cursor dropped: the WAL kept for followers is over its limit");
+                    cursors.remove(&id);
+                    node.sending_snapshots.lock().last_index.remove(&id);
+                    // It gets a new cursor when it is next seen, but nothing is held for it until
+                    // then: purge now.
+                    over_budget = Some(id);
+                }
+                if let Some(lowest) = cursors.values().map(|c| c.position).min() {
+                    target = target.min(lowest);
+                }
+                // The follower just released is behind the new purge point from now on: its
+                // next cursor starts there.
+                if over_budget.is_some() {
+                    requested = requested.max(target);
+                }
+            }
+            _ => {
+                cursors.clear();
+                heard.clear();
+            }
+        }
+        if target > purged {
+            match node.raft.trigger().purge_log(target).await {
+                Ok(()) => requested = target,
+                Err(e) => tracing::warn!(error = %e, "log purge failed"),
+            }
+        }
+    }
+}
+
+/// Flush-driven WAL trim. A dropped unit frees its WAL entries, but files are deleted only once a
+/// snapshot covers them. Rather than wait for the next snapshot by entry count (which can leave
+/// gigabytes behind when entries are large), every node takes a snapshot soon after a drop. A
+/// snapshot is metadata only, a few KB. At most one per second.
+async fn run_wal_trimmer(inner: std::sync::Weak<Inner>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Some(node) = inner.upgrade() else { break };
+        if node.sm.trim_pending.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && let Err(e) = node.raft.trigger().snapshot().await
+        {
+            tracing::warn!(error = %e, "snapshot after a trim failed");
+        }
+    }
+}
+
 /// Starts one flush worker per table as tables appear.
 async fn run_flush_supervisor(inner: std::sync::Weak<Inner>) {
     let mut started: HashMap<String, JoinHandle<()>> = HashMap::new();
@@ -1016,7 +1399,7 @@ async fn run_table_flusher(inner: std::sync::Weak<Inner>, table: String) {
                 let _ = tokio::time::timeout(TICK, sm.applied.notified()).await;
             }
             Err(e) => {
-                let backoff = node.table(&table).map(|t| t.def.config.retry_backoff).unwrap_or(TICK);
+                let backoff = node.table(&table).map(|t| t.config().retry_backoff).unwrap_or(TICK);
                 if !matches!(e, Error::NotLeader { .. }) {
                     tracing::warn!(%table, error = %e, "flush step failed");
                     node.record_failure(&table, e.to_string());
@@ -1031,7 +1414,7 @@ async fn run_table_flusher(inner: std::sync::Weak<Inner>, table: String) {
 /// One step of the flush state machine for a table. Returns whether it made progress.
 async fn flush_step(inner: &Arc<Inner>, table: &str) -> Result<bool> {
     let t = inner.table(table)?;
-    let cfg = t.def.config.clone();
+    let cfg = t.config();
 
     enum Next {
         Drop(u64),
@@ -1090,7 +1473,10 @@ async fn flush_step(inner: &Arc<Inner>, table: &str) -> Result<bool> {
         }
         Next::Load { mem, seq_end, label } => {
             let _slot = inner.load_slots.acquire().await.map_err(|_| Error::Load("shutting down".into()))?;
-            load_until_visible(inner, &t, &mem, &label).await?;
+            inner.load_started.lock().insert(table.to_string(), Instant::now());
+            let loaded = load_with_watchdog(inner, &t, &mem, &label).await;
+            inner.load_started.lock().remove(table);
+            loaded?;
             inner.propose(Request::FlushDone { table: table.into(), seq_end }).await?;
             inner.record_success(table);
             tracing::debug!(%table, %label, rows = mem.rows(), "flush visible");
@@ -1099,11 +1485,33 @@ async fn flush_step(inner: &Arc<Inner>, table: &str) -> Result<bool> {
     }
 }
 
+/// Runs [`load_until_visible`] under a time limit. A load that is still running is reported every
+/// 10 seconds; one that exceeds the table's `load_timeout` is abandoned, and the flusher submits
+/// the unit again. Abandoning is safe: a repeated unit is a no-op in Doris.
+async fn load_with_watchdog(inner: &Inner, t: &TableSm, mem: &Memtable, label: &str) -> Result<()> {
+    let limit = t.config().load_timeout;
+    let started = Instant::now();
+    let load = load_until_visible(inner, t, mem, label);
+    tokio::pin!(load);
+    loop {
+        let step = Duration::from_secs(10).min(limit.saturating_sub(started.elapsed()));
+        match tokio::time::timeout(step, &mut load).await {
+            Ok(result) => return result,
+            Err(_) if started.elapsed() >= limit => {
+                return Err(Error::Load(format!("load {label} was not visible after {limit:?}; it will be submitted again")));
+            }
+            Err(_) => {
+                tracing::warn!(table = %t.def.full_name(), %label, rows = mem.rows(), running_secs = started.elapsed().as_secs(), "load is still running");
+            }
+        }
+    }
+}
+
 /// Makes the unit visible in Doris under `label`. Success is only ever taken from the label's
 /// state as reported by Doris.
 async fn load_until_visible(inner: &Inner, t: &TableSm, mem: &Memtable, label: &str) -> Result<()> {
     let loader = inner.loaders.get(&t.loader).ok_or_else(|| Error::Load(format!("no loader named {} on this node", t.loader)))?;
-    let poll = t.def.config.poll_interval;
+    let poll = t.config().poll_interval;
     // A previous leader (or attempt) may already have submitted this label.
     match loader.state(&t.def, label).await? {
         LoadState::Visible => return finish(loader.as_ref(), t, label).await,
@@ -1164,4 +1572,44 @@ fn build_unit(t: &TableSm, mem: &Memtable, label: &str) -> Result<LoadUnit> {
         seq_start,
         seq_end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatchUpCursor;
+
+    #[test]
+    fn a_cursor_holds_what_its_follower_may_still_read() {
+        let purged = 100;
+        let cursor = |position, known, pinned| CatchUpCursor { position, epoch: purged, known, pinned };
+
+        // Progress not reported yet: hold from the purge point, however long it stays unknown.
+        let unknown = CatchUpCursor::advance(None, None, purged, None);
+        assert_eq!(unknown, cursor(100, false, false));
+        assert_eq!(CatchUpCursor::advance(Some(unknown), None, 100, Some(250)), unknown);
+
+        // First report, a little behind the leader: hold from where it is.
+        assert_eq!(CatchUpCursor::advance(Some(unknown), Some(150), purged, None), cursor(150, true, false));
+        assert_eq!(CatchUpCursor::advance(None, Some(150), purged, None), cursor(150, true, false));
+        // A snapshot from an earlier catch-up, which it is already past, changes nothing.
+        assert_eq!(CatchUpCursor::advance(None, Some(150), purged, Some(120)), cursor(150, true, false));
+
+        // First report, behind the purge point: it needs a snapshot. Until one is on its way,
+        // everything is held, whatever snapshots the leader takes for itself meanwhile.
+        let waiting = CatchUpCursor::advance(Some(unknown), Some(40), purged, None);
+        assert_eq!(waiting, cursor(100, true, false));
+        assert_eq!(CatchUpCursor::advance(Some(waiting), Some(40), purged, None), waiting);
+        // The send starts with the snapshot at 180: hold from exactly there while it installs.
+        let pinned = CatchUpCursor::advance(Some(waiting), Some(40), purged, Some(180));
+        assert_eq!(pinned, cursor(180, true, true));
+        // A newer snapshot sent meanwhile does not move the hold: the follower may install
+        // either, and needs the log after the one it installs.
+        assert_eq!(CatchUpCursor::advance(Some(pinned), Some(40), 100, Some(260)), pinned);
+        // Installed the first one: follow it forward from there.
+        let installed = CatchUpCursor::advance(Some(pinned), Some(180), 100, Some(260));
+        assert_eq!(installed, cursor(180, true, false));
+        assert_eq!(CatchUpCursor::advance(Some(installed), Some(950), 100, Some(260)), cursor(950, true, false));
+        // A cursor never moves back.
+        assert_eq!(CatchUpCursor::advance(Some(cursor(950, true, false)), Some(900), 100, Some(260)), cursor(950, true, false));
+    }
 }

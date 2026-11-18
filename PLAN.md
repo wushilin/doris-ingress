@@ -126,7 +126,7 @@ Every file (log segment, `raft-meta`, snapshot) = **file header** + **frames**, 
 - Tested: every single-bit flip in a frame is detected; every truncation is reported as torn.
 
 ### 5.2 Segments and recovery (`src/wal/mod.rs`)
-- Segments named by first index, rolled at 64 MB; one IO thread executes appends, truncation,
+- Segments named by first index, rolled at 100 MiB (`wal_segment_mb`); one IO thread executes appends, truncation,
   purge and metadata writes in submission order (a vote write never overtakes a log write).
 - Reads verify the CRC of every frame read.
 - On open, a corrupt or partial suffix of the **last** segment is a torn write and is truncated;
@@ -344,7 +344,7 @@ WHERE b.k IS NULL OR b.__deleted = false;
 | D9 | 2PC is internal to doris-ingress (read as: terminates here; cap + expiry added) | User, interpretation to confirm |
 | D10 | Partition policy as in §9 | Proposed in review, **to confirm** |
 | D11 | Memtable = Arrow batches + PK index (was: row skiplist) | Proposed in review, **to confirm** |
-| D12 | Flush-driven log trim, on-demand snapshots (was: snapshot-driven) | Proposed in review, **to confirm** |
+| D12 | Flush-driven log trim, on-demand snapshots (was: snapshot-driven) | Built: each node snapshots within 1 s of a `Drop` |
 | D13 | Cut from v1: clean cache, SQL DML, JDBC ingest | Proposed in review, **to confirm** |
 | D14 | Flush protocol: deterministic label, replicated intent, success only from label state, crash check (§7.2a) | User |
 | D15 | Raft and WAL are first class: own WAL with CRC32C, versioned container format with build tag, group commit, writers wait on commit | User |

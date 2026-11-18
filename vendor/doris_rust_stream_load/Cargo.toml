@@ -1,0 +1,40 @@
+[package]
+name = "doris_rust_stream_load"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["wushilin"]
+description = "High-throughput Apache Doris Stream Load client for Rust"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/wushilin/doris_rust_stream_load"
+homepage = "https://github.com/wushilin/doris_rust_stream_load"
+documentation = "https://docs.rs/doris_rust_stream_load"
+keywords = ["doris", "stream-load", "apache-doris", "csv", "json"]
+categories = ["database", "asynchronous", "web-programming::http-client"]
+include = [
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+csv = "1.2"
+url = "2"
+thiserror = "1.0"
+rand = "0.8"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# Keep h2's transitive indexmap resolution compatible with Rust/Cargo 1.75.
+indexmap = "2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+bzip2 = { version = "0.5", default-features = false, features = ["libbz2-rs-sys"] }
+lz4_flex = "0.11"
+lzokay = { version = "2", default-features = false, features = ["std", "compress", "decompress"] }

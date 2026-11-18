@@ -47,6 +47,8 @@ pub enum Request {
     FlushDone { table: String, seq_end: u64 },
     /// The unit's grace period passed; free it.
     Drop { table: String, seq_end: u64 },
+    /// Replace the table's settings (flush sizes and timings, grace, memory cap, ...).
+    SetTableConfig { table: String, config: Box<crate::config::TableConfig> },
 }
 
 impl fmt::Display for Request {
@@ -58,6 +60,7 @@ impl fmt::Display for Request {
             Request::FlushStart { table, seq_end, label } => write!(f, "FlushStart({table}, {seq_end}, {label})"),
             Request::FlushDone { table, seq_end } => write!(f, "FlushDone({table}, {seq_end})"),
             Request::Drop { table, seq_end } => write!(f, "Drop({table}, {seq_end})"),
+            Request::SetTableConfig { table, .. } => write!(f, "SetTableConfig({table})"),
         }
     }
 }
@@ -87,12 +90,56 @@ pub type StoredMembership = openraft::type_config::alias::StoredMembershipOf<Typ
 pub type SnapshotMeta = openraft::type_config::alias::SnapshotMetaOf<TypeConfig>;
 pub type Raft = openraft::Raft<TypeConfig, state_machine::StateMachine>;
 
-/// Snapshot payload sent to a lagging follower: state metadata plus the raw log entries that
-/// still hold unflushed or grace-period rows.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Snapshot payload for a lagging follower: state metadata plus the raw log entries that still
+/// hold unflushed or grace-period rows.
+#[derive(Clone, Debug, Default)]
 pub struct SnapshotData {
     pub meta: Bytes,
-    pub entries: Vec<(u64, Bytes)>,
+    pub entries: SnapshotEntries,
+}
+
+/// Where a snapshot's entries are. They can be many gigabytes, so they are never all in memory
+/// for a transfer: the leader reads them from its WAL as it sends, and the follower writes them
+/// to its snapshot file as they arrive.
+#[derive(Clone)]
+pub enum SnapshotEntries {
+    /// In memory (a snapshot that has just been built carries none).
+    Memory(Vec<(u64, Bytes)>),
+    /// On the sending node: read one at a time from the snapshot file's embedded entries or the
+    /// WAL, which is kept from being trimmed for as long as this is alive.
+    Lazy(std::sync::Arc<state_machine::LazyEntries>),
+    /// On the receiving node: already written to this snapshot file.
+    File(std::path::PathBuf),
+}
+
+impl Default for SnapshotEntries {
+    fn default() -> Self {
+        Self::Memory(Vec::new())
+    }
+}
+
+impl fmt::Debug for SnapshotEntries {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory(v) => write!(f, "Memory({} entries)", v.len()),
+            Self::Lazy(l) => write!(f, "Lazy({} entries)", l.len()),
+            Self::File(p) => write!(f, "File({})", p.display()),
+        }
+    }
+}
+
+impl SnapshotEntries {
+    /// The entries in index order, read one at a time.
+    pub fn read(self) -> Box<dyn Iterator<Item = std::io::Result<(u64, Bytes)>> + Send> {
+        match self {
+            Self::Memory(v) => Box::new(v.into_iter().map(Ok)),
+            Self::Lazy(l) => Box::new((0..l.len()).map(move |k| l.get(k))),
+            Self::File(path) => match state_machine::read_snapshot_entries(&path) {
+                Ok(entries) => Box::new(entries.into_iter().map(Ok)),
+                Err(e) => Box::new(std::iter::once(Err(e))),
+            },
+        }
+    }
 }
 
 pub(crate) fn encode<T: Serialize>(v: &T) -> std::io::Result<Bytes> {

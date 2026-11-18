@@ -7,6 +7,11 @@ flight_listen = "0.0.0.0:8815"
 # First start only: the node with the lowest id initializes the cluster with these voters.
 initial_members = [[1, "10.0.0.1:7701"], [2, "10.0.0.2:7701"], [3, "10.0.0.3:7701"]]
 memory_target_mb = 8192
+# max_admission_wait_s = 60  # how long a write waits for buffer space before a retryable error
+# catch_up_idle_s = 30       # a follower silent this long loses its hold on the leader's log
+# catch_up_hold_mb = 2048    # most WAL the leader keeps for followers that are behind
+# snapshot_send_mb_per_s = 200  # most MiB per second one snapshot send to a follower may take
+# wal_segment_mb = 100       # a WAL file is closed and a new one started at this size
 max_concurrent_loads = 4
 
 [users]            # Flight SQL / ADBC credentials
@@ -19,6 +24,14 @@ mysql_port = 9030
 user = "loader"
 password = "env:DORIS_PASSWORD"
 tls = true
+# Optional, for loader = "stream_sdk" (the values shown are the defaults):
+# [doris.sdk]
+# workers = 4          # concurrent uploads per table
+# linger_ms = 5        # how long an open batch waits for more rows
+# batch_mb = 80        # largest request body before compression (at most 90)
+# gzip = true
+# dry_run = false      # true: send nothing to Doris; every upload "succeeds" after dry_run_delay_ms
+# dry_run_delay_ms = 500
 # Required for loader = "broker":
 # [doris.s3]
 # endpoint = "https://s3.ap-southeast-1.amazonaws.com"
@@ -30,6 +43,7 @@ tls = true
 
 [[tables]]
 name = "db.orders"           # must be Unique Key, merge-on-write, with a sequence column
-loader = "stream"            # or "broker"
+loader = "stream"            # one Parquet load per flush; or "stream_sdk" (CSV, several workers), or "broker"
 flush_interval_ms = 2000
 grace_ms = 10000
+# load_timeout_s = 120       # a load not visible after this long is abandoned and submitted again

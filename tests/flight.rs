@@ -210,6 +210,150 @@ async fn prepared_statements_bind_parameters_and_fast_path_matches_datafusion() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delete_by_primary_key_in_sql() {
+    let (_dir, node, url) = setup().await;
+    let mut c = client(&url).await;
+    c.handshake("admin", "secret").await.unwrap();
+    ingest(&mut c, vec![rows(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f"), (7, "g")])]).await;
+    let live = async |c: &mut FlightSqlServiceClient<Channel>| {
+        let got = query(c, "SELECT k FROM db.t WHERE NOT __deleted ORDER BY k").await;
+        got.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec()).collect::<Vec<i64>>()
+    };
+
+    // As an update statement: `=` and `IN`. The count is the number of keys named.
+    assert_eq!(c.execute_update("DELETE FROM db.t WHERE k = 1".into(), None).await.unwrap(), 1);
+    assert_eq!(c.execute_update("DELETE FROM db.t WHERE k IN (2, 3)".into(), None).await.unwrap(), 2);
+    assert_eq!(live(&mut c).await, vec![4, 5, 6, 7]);
+
+    // As a query (what a SQL console sends): the result is one `count` row.
+    let got = query(&mut c, "DELETE FROM db.t WHERE 4 = k").await;
+    assert_eq!(got[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 1);
+
+    // As a prepared statement, executed with different parameters.
+    let mut p = c.prepare("DELETE FROM db.t WHERE k = $1".into(), None).await.unwrap();
+    let param_schema = Arc::new(Schema::new(vec![Field::new("$1", DataType::Int64, false)]));
+    for k in [5, 6] {
+        p.set_parameters(RecordBatch::try_new(param_schema.clone(), vec![Arc::new(Int64Array::from(vec![k]))]).unwrap()).unwrap();
+        assert_eq!(p.execute_update().await.unwrap(), 1);
+    }
+    p.close().await.unwrap();
+    assert_eq!(live(&mut c).await, vec![7]);
+
+    // A key that is not in the buffer still gets a tombstone (its row may be in Doris).
+    assert_eq!(c.execute_update("DELETE FROM db.t WHERE k = 99".into(), None).await.unwrap(), 1);
+    let got = query(&mut c, "SELECT __deleted FROM db.t WHERE k = 99").await;
+    assert!(got[0].column(0).as_boolean().value(0));
+
+    // Anything but the primary key alone is refused, and deletes nothing.
+    for sql in [
+        "DELETE FROM db.t",
+        "DELETE FROM db.t WHERE v = 'g'",
+        "DELETE FROM db.t WHERE k = 7 AND v = 'g'",
+        "DELETE FROM db.t WHERE k = 7 OR k = 8",
+        "DELETE FROM db.t WHERE k > 1",
+        "DELETE FROM db.t WHERE k NOT IN (1)",
+        "DELETE FROM db.t WHERE k = NULL",
+        "DELETE FROM db.t WHERE k = 'x'",
+        "UPDATE db.t SET v = 'z' WHERE k = 7",
+    ] {
+        assert!(c.execute_update(sql.into(), None).await.is_err(), "{sql} must be refused as an update");
+        let as_query = match c.execute(sql.into(), None).await {
+            Ok(info) => match c.do_get(info.endpoint[0].ticket.clone().unwrap()).await {
+                Ok(stream) => stream.try_collect::<Vec<_>>().await.map(|_| ()).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        assert!(as_query.is_err(), "{sql} must be refused as a query");
+    }
+    assert_eq!(live(&mut c).await, vec![7]);
+
+    // Composite key: every key column must be named, with `=`.
+    let mut def = table_def_named("c", fast_config());
+    def.key_columns = vec!["k".into(), "v".into()];
+    node.attach(def, "mock", 1).await.unwrap();
+    let cmd = CommandStatementIngest { table: "c".into(), schema: Some("db".into()), ..Default::default() };
+    c.execute_ingest(cmd, futures_util::stream::iter(vec![Ok(rows(&[(1, "a"), (1, "b"), (2, "a")]))])).await.unwrap();
+    assert!(c.execute_update("DELETE FROM db.c WHERE k = 1".into(), None).await.is_err());
+    assert!(c.execute_update("DELETE FROM db.c WHERE k IN (1, 2)".into(), None).await.is_err());
+    assert_eq!(c.execute_update("DELETE FROM db.c WHERE v = 'b' AND k = 1".into(), None).await.unwrap(), 1);
+    let got = query(&mut c, "SELECT k, v FROM db.c WHERE NOT __deleted ORDER BY k").await;
+    let b = arrow::compute::concat_batches(&got[0].schema(), &got).unwrap();
+    assert_eq!(b.column(0).as_primitive::<Int64Type>().values().to_vec(), vec![1, 2]);
+    assert_eq!(b.column(1).as_string::<i32>().iter().collect::<Vec<_>>(), vec![Some("a"), Some("a")]);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_in_sql_upserts_full_rows() {
+    let (_dir, node, url) = setup().await;
+    let mut c = client(&url).await;
+    c.handshake("admin", "secret").await.unwrap();
+    let live = async |c: &mut FlightSqlServiceClient<Channel>| {
+        let got = query(c, "SELECT k, v FROM db.t WHERE NOT __deleted ORDER BY k").await;
+        let b = arrow::compute::concat_batches(&got[0].schema(), &got).unwrap();
+        let (k, v) = (b.column(0).as_primitive::<Int64Type>(), b.column(1).as_string::<i32>());
+        (0..b.num_rows()).map(|i| (k.value(i), v.is_valid(i).then(|| v.value(i).to_string()))).collect::<Vec<_>>()
+    };
+    let s = |v: &str| Some(v.to_string());
+
+    // Without a column list (the hidden columns need no values), and with one in any order.
+    assert_eq!(c.execute_update("INSERT INTO db.t VALUES (1, 'a'), (2, 'b')".into(), None).await.unwrap(), 2);
+    assert_eq!(c.execute_update("INSERT INTO db.t (v, k) VALUES ('c', 3)".into(), None).await.unwrap(), 1);
+    assert_eq!(live(&mut c).await, vec![(1, s("a")), (2, s("b")), (3, s("c"))]);
+
+    // An existing key is replaced, and a column that is left out becomes null.
+    assert_eq!(c.execute_update("INSERT INTO ingress.db.t VALUES (1, 'a2')".into(), None).await.unwrap(), 1);
+    assert_eq!(c.execute_update("INSERT INTO db.t (k) VALUES (2)".into(), None).await.unwrap(), 1);
+    assert_eq!(live(&mut c).await, vec![(1, s("a2")), (2, None), (3, s("c"))]);
+
+    // A deleted key can be inserted again.
+    assert_eq!(c.execute_update("DELETE FROM db.t WHERE k = 3".into(), None).await.unwrap(), 1);
+    assert_eq!(c.execute_update("INSERT INTO db.t VALUES (3, 'c2')".into(), None).await.unwrap(), 1);
+
+    // As a query: the result is one `count` row. And from a SELECT over the buffer.
+    let got = query(&mut c, "INSERT INTO db.t VALUES (4, 'd')").await;
+    assert_eq!(got[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 1);
+    assert_eq!(c.execute_update("INSERT INTO db.t SELECT k + 10, v FROM db.t WHERE k <= 2".into(), None).await.unwrap(), 2);
+    assert_eq!(
+        live(&mut c).await,
+        vec![(1, s("a2")), (2, None), (3, s("c2")), (4, s("d")), (11, s("a2")), (12, None)]
+    );
+
+    // As a prepared statement with parameters.
+    let mut p = c.prepare("INSERT INTO db.t (k, v) VALUES ($1, $2)".into(), None).await.unwrap();
+    let param_schema = Arc::new(Schema::new(vec![Field::new("$1", DataType::Int64, false), Field::new("$2", DataType::Utf8, true)]));
+    for (k, v) in [(5, "e"), (1, "a3")] {
+        let params = RecordBatch::try_new(param_schema.clone(), vec![Arc::new(Int64Array::from(vec![k])), Arc::new(StringArray::from(vec![v]))]);
+        p.set_parameters(params.unwrap()).unwrap();
+        assert_eq!(p.execute_update().await.unwrap(), 1);
+    }
+    p.close().await.unwrap();
+    let got = live(&mut c).await;
+    assert_eq!(got[0], (1, s("a3")));
+    assert!(got.contains(&(5, s("e"))));
+
+    // Refused: the hidden columns, a null or missing key, wrong shapes.
+    for sql in [
+        "INSERT INTO db.t (k, v, __seq) VALUES (9, 'z', 1)",
+        "INSERT INTO db.t (k, v, __deleted) VALUES (9, 'z', true)",
+        "INSERT INTO db.t (k, v, __delete) VALUES (9, 'z', true)",
+        "INSERT INTO db.t (k, v, \"__SEQ\") VALUES (9, 'z', 1)",
+        "INSERT INTO db.t VALUES (9, 'z', 1, false)",
+        "INSERT INTO db.t (v) VALUES ('z')",
+        "INSERT INTO db.t VALUES (NULL, 'z')",
+        "INSERT INTO db.t VALUES (9)",
+        "INSERT INTO db.t (k, nope) VALUES (9, 'z')",
+        "INSERT INTO db.nope VALUES (9, 'z')",
+        "INSERT OVERWRITE db.t VALUES (9, 'z')",
+    ] {
+        assert!(c.execute_update(sql.into(), None).await.is_err(), "{sql} must be refused");
+    }
+    assert!(!live(&mut c).await.iter().any(|(k, _)| *k == 9));
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_queries_are_accepted_and_multi_scan_queries_work() {
     let (_dir, node, url) = setup().await;
     let mut c = client(&url).await;
@@ -218,6 +362,17 @@ async fn only_queries_are_accepted_and_multi_scan_queries_work() {
     for sql in ["CREATE TABLE x AS SELECT 1", "CREATE VIEW v AS SELECT * FROM db.t", "SET datafusion.execution.batch_size = 1", "DROP TABLE db.t"] {
         assert!(c.execute(sql.into(), None).await.is_err(), "{sql} must be refused");
     }
+    // Status tables describe the answering node; an INSERT into one is refused.
+    let got = query(&mut c, "SELECT node_id, is_leader, leader_id, tables FROM system.node").await;
+    assert_eq!(got[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 1);
+    assert!(got[0].column(1).as_boolean().value(0));
+    assert_eq!(got[0].column(2).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 1);
+    assert_eq!(got[0].column(3).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 1);
+    let got = query(&mut c, "SELECT name, key_columns, active_rows FROM system.tables WHERE db = 'db'").await;
+    assert_eq!(got[0].column(0).as_string::<i32>().value(0), "t");
+    assert_eq!(got[0].column(1).as_string::<i32>().value(0), "k");
+    assert_eq!(got[0].column(2).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 2);
+    assert!(c.execute_update("INSERT INTO system.node (node_id) VALUES (9)".into(), None).await.is_err());
     // Two scans of the same table in one query (read at one snapshot).
     let got = query(&mut c, "SELECT a.k, b.v FROM db.t a JOIN db.t b ON a.k = b.k UNION ALL SELECT k, v FROM db.t").await;
     assert_eq!(got.iter().map(|b| b.num_rows()).sum::<usize>(), 4);

@@ -4,6 +4,7 @@
 //! only treats a unit as done once [`Loader::state`] reports [`LoadState::Visible`] for its label.
 
 mod broker;
+mod sdk;
 mod stream;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 pub use broker::{BrokerLoadConfig, BrokerLoader, S3Config};
+pub use sdk::{SdkLoadConfig, SdkLoader};
 pub use stream::{StreamLoadConfig, StreamLoader};
 
 use crate::error::Result;

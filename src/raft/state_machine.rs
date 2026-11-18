@@ -26,13 +26,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use super::log_store::RetentionFloor;
-use super::{Entry, LogId, Request, Response, SnapshotData, SnapshotMeta, StoredMembership, TypeConfig, decode, encode};
+use super::{Entry, LogId, Request, Response, SnapshotData, SnapshotEntries, SnapshotMeta, StoredMembership, TypeConfig, decode, encode};
 use crate::config::MemoryConfig;
 use crate::memory::Governor;
 use crate::memtable::Memtable;
 use crate::schema::{TableCodec, TableDef, TableDefWire};
 use crate::wal::format::{FileKind, Frame, FrameKind, build_tag};
-use crate::wal::{Wal, read_container_file, write_container_file};
+use crate::wal::{Wal, publish_file, read_container_file, write_container_file};
 
 /// Where a buffered row came from: op `op` of the Write entry at `index`, first seq `base_seq`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +64,12 @@ pub(crate) struct Units {
     /// Frozen units in seq order.
     pub frozen: VecDeque<Unit>,
     pub bytes: usize,
+    /// Watermarks. Both move only when a Raft entry is applied, so every node has the same value
+    /// at the same point in the log, and both are stored in snapshots.
+    /// Highest sequence number known to be visible in Doris (`FlushDone`).
+    pub visible_seq: u64,
+    /// Highest sequence number trimmed from the buffer (`Drop`). Rows up to it are only in Doris.
+    pub trimmed_seq: u64,
 }
 
 impl Units {
@@ -91,8 +97,30 @@ pub(crate) struct TableSm {
     pub def: Arc<TableDef>,
     pub codec: TableCodec,
     pub loader: String,
+    /// The table's current settings. They start as `def.config` and can be replaced by a
+    /// `SetTableConfig` entry, so read them through [`TableSm::config`], not through `def`.
+    pub settings: parking_lot::RwLock<crate::config::TableConfig>,
     pub units: Mutex<Units>,
+    /// Delay for each write to this table, in microseconds: 0 for none, [`WRITE_HOLD`] to hold
+    /// writes until space is freed. Local to the node, not replicated: the backpressure monitor
+    /// publishes it every 100 ms and every write reads it.
+    pub write_delay_us: AtomicU64,
 }
+
+impl TableSm {
+    fn new(def: TableDef, codec: TableCodec, loader: String, units: Units) -> Self {
+        let settings = parking_lot::RwLock::new(def.config.clone());
+        Self { def: Arc::new(def), codec, loader, settings, units: Mutex::new(units), write_delay_us: AtomicU64::new(0) }
+    }
+
+    /// The table's current settings.
+    pub fn config(&self) -> crate::config::TableConfig {
+        self.settings.read().clone()
+    }
+}
+
+/// Value of [`TableSm::write_delay_us`] that holds writes.
+pub(crate) const WRITE_HOLD: u64 = u64::MAX;
 
 /// Apply progress. Only the apply task writes it; snapshot capture reads it consistently.
 struct ApplyMeta {
@@ -116,8 +144,21 @@ pub struct SmCore {
     /// Entries referenced by the current snapshot that are not in the local WAL.
     embedded: Mutex<BTreeMap<u64, Bytes>>,
     current: Mutex<Option<(SnapshotMeta, PathBuf)>>,
+    /// Held while the stored snapshot is replaced (with the retention floor that goes with it),
+    /// and while it is read back for a follower. A stored snapshot keeps only references to the
+    /// entries behind its rows, so those entries must stay in the WAL for as long as it is the
+    /// current one, and for as long as someone is reading it.
+    snapshot_io: Mutex<()>,
+    /// The retention floor the current snapshot needs, and the floors of snapshots being read
+    /// for a follower right now. The WAL is kept from the lowest of them.
+    snapshot_floor: AtomicU64,
+    floor_pins: Mutex<Vec<u64>>,
     /// Signalled after every applied entry.
     pub(crate) applied: Notify,
+    /// Set when a unit is dropped: its WAL entries are free, so a snapshot can let them go.
+    pub(crate) trim_pending: std::sync::atomic::AtomicBool,
+    /// Snapshots installed from a leader since this node started.
+    pub(crate) snapshots_installed: AtomicU64,
     /// Time spent applying entries, and entries/ops applied (for diagnosing apply saturation).
     pub apply_nanos: AtomicU64,
     pub apply_entries: AtomicU64,
@@ -144,6 +185,11 @@ struct TableSnap {
     loader: String,
     active_refs: Vec<EntryRef>,
     units: Vec<UnitSnap>,
+    /// Watermarks (absent in snapshots written before they existed).
+    #[serde(default)]
+    visible_seq: u64,
+    #[serde(default)]
+    trimmed_seq: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,6 +204,12 @@ impl SmCore {
     /// Opens the state machine, restoring the latest snapshot (if any) from disk.
     pub fn open(wal: Arc<Wal>, snap_dir: PathBuf, floor: RetentionFloor, memory: &MemoryConfig) -> io::Result<Arc<Self>> {
         fs::create_dir_all(&snap_dir)?;
+        // A snapshot that was still being received when the node stopped.
+        for e in fs::read_dir(&snap_dir)?.flatten() {
+            if e.file_name().to_str().is_some_and(|n| n.starts_with("incoming-")) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
         let core = Arc::new(Self {
             tables: RwLock::new(BTreeMap::new()),
             meta: Mutex::new(ApplyMeta { last_applied: None, membership: StoredMembership::default(), next_seq: 1 }),
@@ -168,7 +220,12 @@ impl SmCore {
             floor,
             embedded: Mutex::default(),
             current: Mutex::default(),
+            snapshot_io: Mutex::default(),
+            snapshot_floor: AtomicU64::new(u64::MAX),
+            floor_pins: Mutex::default(),
             applied: Notify::new(),
+            trim_pending: std::sync::atomic::AtomicBool::new(false),
+            snapshots_installed: AtomicU64::new(0),
             apply_nanos: AtomicU64::new(0),
             apply_entries: AtomicU64::new(0),
             apply_ops: AtomicU64::new(0),
@@ -230,7 +287,7 @@ impl SmCore {
                 };
                 tables.insert(
                     name,
-                    Arc::new(TableSm { def: Arc::new(def), codec, loader: loader.clone(), units: Mutex::default() }),
+                    Arc::new(TableSm::new(def, codec, loader.clone(), Units::default())),
                 );
                 m.next_seq = m.next_seq.max(*min_next_seq);
                 Response::Ok
@@ -255,22 +312,45 @@ impl SmCore {
             Request::FlushDone { table, seq_end } => self.with_units(table, |u| match u.unit_mut(*seq_end) {
                 Some(unit) => {
                     unit.state = UnitState::Visible;
+                    u.visible_seq = u.visible_seq.max(*seq_end);
                     Response::Ok
                 }
                 None => Response::Rejected(format!("no unit ending at {seq_end}")),
             }),
-            Request::Drop { table, seq_end } => self.with_units(table, |u| {
-                match u.frozen.iter().position(|x| x.seq_end == *seq_end && x.state == UnitState::Visible) {
-                    Some(pos) => {
-                        let unit = u.frozen.remove(pos).expect("position is valid");
-                        let freed = unit.mem.bytes();
-                        u.bytes -= freed;
-                        self.governor.release(freed);
-                        Response::Ok
-                    }
-                    None => Response::Rejected(format!("no visible unit ending at {seq_end}")),
+            Request::SetTableConfig { table, config } => match self.table(table) {
+                Some(t) => {
+                    *t.settings.write() = (**config).clone();
+                    Response::Ok
                 }
-            }),
+                None => Response::Rejected(format!("unknown table {table}")),
+            },
+            // The trim: every node drops the unit at the same point in the log. Its WAL entries
+            // are no longer referenced, so the segments holding them can be deleted.
+            Request::Drop { table, seq_end } => {
+                let mut trimmed = None;
+                let response = self.with_units(table, |u| {
+                    match u.frozen.iter().position(|x| x.seq_end == *seq_end && x.state == UnitState::Visible) {
+                        Some(pos) => {
+                            let unit = u.frozen.remove(pos).expect("position is valid");
+                            let freed = unit.mem.bytes();
+                            u.bytes -= freed;
+                            u.trimmed_seq = u.trimmed_seq.max(*seq_end);
+                            self.governor.release(freed);
+                            trimmed = Some((unit.seq_start, unit.mem.rows(), freed));
+                            Response::Ok
+                        }
+                        None => Response::Rejected(format!("no visible unit ending at {seq_end}")),
+                    }
+                });
+                if trimmed.is_some() {
+                    self.trim_pending.store(true, Ordering::Relaxed);
+                }
+                if let (Some((seq_start, rows, bytes)), Some(t)) = (trimmed, self.table(table)) {
+                    let label = crate::loader::make_label(&t.def, seq_start, *seq_end);
+                    tracing::info!(%table, %label, seq_start, seq_end = *seq_end, rows, bytes, "trim: dropped a unit that is visible in Doris");
+                }
+                response
+            }
         }
     }
 
@@ -391,10 +471,12 @@ impl SmCore {
                 })
                 .collect();
             tables.push(TableSnap {
-                def: t.def.to_wire().map_err(io::Error::other)?,
+                def: crate::schema::TableDefWire { config: t.config(), ..t.def.to_wire().map_err(io::Error::other)? },
                 loader: t.loader.clone(),
                 active_refs: u.active_refs.clone(),
                 units,
+                visible_seq: u.visible_seq,
+                trimmed_seq: u.trimmed_seq,
             });
         }
         let state = encode(&SnapState { build: build_tag(), next_seq: m.next_seq, tables })?;
@@ -457,6 +539,8 @@ impl SmCore {
             units.bytes += fill(&mut active, &t.active_refs)?;
             units.active = active;
             units.active_refs = t.active_refs;
+            units.visible_seq = t.visible_seq;
+            units.trimmed_seq = t.trimmed_seq;
             for us in t.units {
                 let mut mem = Memtable::default();
                 units.bytes += fill(&mut mem, &us.refs)?;
@@ -470,7 +554,7 @@ impl SmCore {
             }
             bytes_total += units.bytes;
             let name = def.full_name();
-            tables.insert(name, Arc::new(TableSm { def: Arc::new(def), codec, loader: t.loader, units: Mutex::new(units) }));
+            tables.insert(name, Arc::new(TableSm::new(def, codec, t.loader, units)));
         }
         let mut m = self.meta.lock();
         let mut attached = self.tables.write();
@@ -486,7 +570,10 @@ impl SmCore {
         Ok(())
     }
 
-    /// Sets the retention floor to the oldest referenced entry that lives in the WAL.
+    /// Sets the retention floor to the oldest entry the live state refers to that lives in the
+    /// WAL. Right only when the live state is exactly the stored snapshot's (at startup and
+    /// after an install); after building a snapshot the floor comes from that snapshot's own
+    /// references (see [`Self::persist_snapshot`]).
     fn update_floor(&self) {
         let embedded = self.embedded.lock();
         let mut floor = u64::MAX;
@@ -498,10 +585,32 @@ impl SmCore {
                 }
             }
         }
-        self.floor.set(floor);
+        self.set_snapshot_floor(floor);
     }
 
+    fn set_snapshot_floor(&self, floor: u64) {
+        let pins = self.floor_pins.lock();
+        self.snapshot_floor.store(floor, Ordering::Release);
+        self.floor.set(pins.iter().copied().min().unwrap_or(u64::MAX).min(floor));
+    }
+
+    /// Keeps the WAL from `index` on until the returned guard is dropped, whatever snapshots are
+    /// built meanwhile.
+    fn pin_floor(self: &Arc<Self>, index: u64) -> FloorPin {
+        let mut pins = self.floor_pins.lock();
+        pins.push(index);
+        self.floor.set(pins.iter().copied().min().unwrap_or(u64::MAX).min(self.snapshot_floor.load(Ordering::Acquire)));
+        FloorPin { core: self.clone(), index }
+    }
+
+    /// Writes the snapshot, makes it the current one and moves the retention floor to the oldest
+    /// WAL entry it refers to. `refs` is sorted.
+    ///
+    /// The floor must come from the snapshot's references, not from the live state: rows can be
+    /// trimmed between the capture and this point, and the entries behind them are still needed
+    /// to read this snapshot back, for a follower or at the next start.
     fn persist_snapshot(&self, meta: &SnapshotMeta, state: &Bytes, refs: &[u64]) -> io::Result<PathBuf> {
+        let _io = self.snapshot_io.lock();
         // Embed referenced entries that are not in the local WAL (e.g. from an installed snapshot).
         let wal_range = self.wal.range();
         let in_wal = |i: u64| wal_range.is_some_and(|(f, l)| i >= f && i <= l);
@@ -530,11 +639,14 @@ impl SmCore {
         {
             let _ = fs::remove_file(old);
         }
+        self.set_snapshot_floor(refs.iter().copied().find(|i| !keep.contains_key(i)).unwrap_or(u64::MAX));
         Ok(path)
     }
 
     /// Full snapshot data for a follower: state plus every referenced entry.
-    fn materialize(&self, path: &Path) -> io::Result<(SnapshotMeta, SnapshotData)> {
+    /// The stored snapshot at `path`, for sending: its entries are read one at a time as they are
+    /// sent, and the WAL they live in is pinned until the result is dropped.
+    fn open_for_sending(self: &Arc<Self>, path: &Path) -> io::Result<(SnapshotMeta, SnapshotData)> {
         let (file, embedded) = read_snapshot_file(path)?;
         let snap: SnapState = decode(&file.state)?;
         let mut indexes: Vec<u64> = snap
@@ -544,16 +656,65 @@ impl SmCore {
             .collect();
         indexes.sort_unstable();
         indexes.dedup();
-        let mut entries = Vec::with_capacity(indexes.len());
-        for i in indexes {
-            let body = match embedded.get(&i) {
-                Some(b) => b.clone(),
-                None => self.entry_body(i)?,
-            };
-            entries.push((i, body));
-        }
-        Ok((file.meta, SnapshotData { meta: file.state, entries }))
+        let pin = indexes.iter().copied().find(|i| !embedded.contains_key(i)).map(|first| self.pin_floor(first));
+        let entries = LazyEntries { indexes, embedded, core: self.clone(), _pin: pin };
+        Ok((file.meta, SnapshotData { meta: file.state, entries: SnapshotEntries::Lazy(Arc::new(entries)) }))
     }
+}
+
+/// Keeps the WAL from one index on while a snapshot that refers to it is being read.
+struct FloorPin {
+    core: Arc<SmCore>,
+    index: u64,
+}
+
+impl Drop for FloorPin {
+    fn drop(&mut self) {
+        let mut pins = self.core.floor_pins.lock();
+        if let Some(at) = pins.iter().position(|i| *i == self.index) {
+            pins.swap_remove(at);
+        }
+        self.core.floor.set(pins.iter().copied().min().unwrap_or(u64::MAX).min(self.core.snapshot_floor.load(Ordering::Acquire)));
+    }
+}
+
+/// The entries of a stored snapshot, read on demand (see [`SnapshotEntries::Lazy`]).
+pub struct LazyEntries {
+    indexes: Vec<u64>,
+    /// Entries the snapshot file carries itself (they were never in this node's WAL).
+    embedded: BTreeMap<u64, Bytes>,
+    core: Arc<SmCore>,
+    _pin: Option<FloorPin>,
+}
+
+impl LazyEntries {
+    pub fn len(&self) -> usize {
+        self.indexes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+    }
+
+    /// The `k`-th entry, with its log index.
+    pub fn get(&self, k: usize) -> io::Result<(u64, Bytes)> {
+        let index = self.indexes[k];
+        let body = match self.embedded.get(&index) {
+            Some(b) => b.clone(),
+            None => self.core.wal.read(index)?.ok_or_else(|| io::Error::other(format!("log entry {index} needed by the snapshot is missing")))?,
+        };
+        Ok((index, body))
+    }
+}
+
+/// The first frame of a snapshot file.
+pub(crate) fn snapshot_head_frame(meta: &SnapshotMeta, state: &Bytes) -> io::Result<Frame> {
+    Ok(Frame::new(FrameKind::SnapshotMeta, 0, encode(&SnapFile { meta: meta.clone(), state: state.clone() })?))
+}
+
+/// A snapshot file's entries.
+pub(crate) fn read_snapshot_entries(path: &Path) -> io::Result<BTreeMap<u64, Bytes>> {
+    Ok(read_snapshot_file(path)?.1)
 }
 
 /// `snapshot-<last applied index>-<nanos>.snap`: sortable by index, unique per build.
@@ -613,9 +774,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf, io::Error> {
         let (meta, state, refs) = self.core.capture()?;
         self.core.persist_snapshot(&meta, &state, &refs)?;
-        self.core.update_floor();
         // openraft keeps only the metadata of a built snapshot; data is materialized on demand.
-        Ok(Snapshot { meta, snapshot: SnapshotData { meta: state, entries: Vec::new() } })
+        Ok(Snapshot { meta, snapshot: SnapshotData { meta: state, entries: SnapshotEntries::default() } })
     }
 }
 
@@ -654,17 +814,25 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     }
 
     async fn install_snapshot(&mut self, meta: &SnapshotMeta, snapshot: SnapshotData) -> Result<(), io::Error> {
-        let entries: BTreeMap<u64, Bytes> = snapshot.entries.into_iter().collect();
+        let _io = self.core.snapshot_io.lock();
         // Persist first (all entries embedded), then switch state.
-        let mut frames = vec![Frame::new(
-            FrameKind::SnapshotMeta,
-            0,
-            encode(&SnapFile { meta: meta.clone(), state: snapshot.meta.clone() })?,
-        )];
-        frames.extend(entries.iter().map(|(i, b)| Frame::new(FrameKind::RaftEntry, *i, b.clone())));
         let path = self.core.snap_dir.join(snapshot_file_name(meta));
-        write_container_file(&path, FileKind::Snapshot, &frames)?;
+        let entries: BTreeMap<u64, Bytes> = match snapshot.entries {
+            // Received over the network: the file is already written. Give it its name.
+            SnapshotEntries::File(received) => {
+                publish_file(&received, &path)?;
+                read_snapshot_entries(&path)?
+            }
+            other => {
+                let entries = other.read().collect::<io::Result<BTreeMap<u64, Bytes>>>()?;
+                let mut frames = vec![snapshot_head_frame(meta, &snapshot.meta)?];
+                frames.extend(entries.iter().map(|(i, b)| Frame::new(FrameKind::RaftEntry, *i, b.clone())));
+                write_container_file(&path, FileKind::Snapshot, &frames)?;
+                entries
+            }
+        };
         self.core.restore(meta, &snapshot.meta, entries)?;
+        self.core.snapshots_installed.fetch_add(1, Ordering::Relaxed);
         let previous = self.core.current.lock().replace((meta.clone(), path.clone()));
         if let Some((_, old)) = previous
             && old != path
@@ -676,8 +844,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<SnapshotOf>, io::Error> {
+        let _io = self.core.snapshot_io.lock();
         let Some((_, path)) = self.core.current.lock().clone() else { return Ok(None) };
-        let (meta, data) = self.core.materialize(&path)?;
+        let (meta, data) = self.core.open_for_sending(&path)?;
         Ok(Some(Snapshot { meta, snapshot: data }))
     }
 }

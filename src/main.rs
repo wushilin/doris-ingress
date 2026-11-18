@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use doris_ingress::doris::{MysqlConfig, describe_table, max_seq};
 use doris_ingress::flight::{FlightConfig, serve};
-use doris_ingress::loader::{BrokerLoadConfig, BrokerLoader, Loader, S3Config, StreamLoadConfig, StreamLoader};
+use doris_ingress::loader::{BrokerLoadConfig, BrokerLoader, Loader, S3Config, SdkLoadConfig, SdkLoader, StreamLoadConfig, StreamLoader};
 use doris_ingress::{Node, NodeConfig, TableConfig};
 use serde::Deserialize;
 
@@ -27,6 +27,18 @@ struct Config {
     #[serde(default)]
     initial_members: Vec<(u64, String)>,
     memory_target_mb: Option<usize>,
+    /// How long a write waits for buffer space before it fails with a retryable error
+    /// (default 60).
+    max_admission_wait_s: Option<u64>,
+    /// A WAL file is closed and a new one started at this size (default 100).
+    wal_segment_mb: Option<u64>,
+    /// A follower silent for this long loses its hold on the leader's log (default 30).
+    catch_up_idle_s: Option<u64>,
+    /// Most WAL the leader keeps for followers that are behind (default 2048).
+    catch_up_hold_mb: Option<u64>,
+    /// Most megabytes per second one snapshot send to a follower may take (default 200; 0: no
+    /// limit).
+    snapshot_send_mb_per_s: Option<u64>,
     max_concurrent_loads: Option<usize>,
     /// Flight SQL users: name → password (`env:VAR` reads the password from the environment).
     users: HashMap<String, String>,
@@ -50,6 +62,27 @@ struct DorisConfig {
     #[serde(default)]
     tls: bool,
     s3: Option<S3Toml>,
+    /// Settings of the `stream_sdk` loader.
+    #[serde(default)]
+    sdk: SdkToml,
+}
+
+/// `[doris.sdk]`: Stream Load through the `doris_rust_stream_load` SDK (CSV rows, several workers).
+#[derive(Deserialize, Default)]
+struct SdkToml {
+    /// Concurrent uploads per table (default 4).
+    workers: Option<usize>,
+    /// How long an open batch waits for more rows (default 5).
+    linger_ms: Option<u64>,
+    /// Largest request body before compression, at most 90 (default 80).
+    batch_mb: Option<usize>,
+    /// Compress request bodies with gzip (default true).
+    gzip: Option<bool>,
+    /// Send nothing to Doris; answer every upload as a success after `dry_run_delay_ms`
+    /// (default false). Flushed rows are discarded.
+    dry_run: Option<bool>,
+    /// Simulated time for one upload in a dry run (default 500).
+    dry_run_delay_ms: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -77,7 +110,7 @@ struct S3Toml {
 struct TableToml {
     /// `db.table`
     name: String,
-    /// `stream` (default) or `broker`.
+    /// `stream` (default), `stream_sdk` or `broker`.
     #[serde(default = "default_loader")]
     loader: String,
     flush_interval_ms: Option<u64>,
@@ -85,6 +118,8 @@ struct TableToml {
     max_load_mb: Option<usize>,
     grace_ms: Option<u64>,
     memory_cap_mb: Option<usize>,
+    /// A load not visible after this many seconds is abandoned and submitted again (default 120).
+    load_timeout_s: Option<u64>,
 }
 
 fn default_loader() -> String {
@@ -113,6 +148,9 @@ impl TableToml {
         if let Some(v) = self.grace_ms {
             c.grace = Duration::from_millis(v);
         }
+        if let Some(v) = self.load_timeout_s {
+            c.load_timeout = Duration::from_secs(v);
+        }
         if let Some(v) = self.memory_cap_mb {
             c.memory_cap_bytes = v << 20;
         }
@@ -136,16 +174,34 @@ async fn main() -> anyhow::Result<()> {
         tls: cfg.doris.tls,
     };
     let mut loaders: HashMap<String, Arc<dyn Loader>> = HashMap::new();
-    loaders.insert(
-        "stream".into(),
-        Arc::new(StreamLoader::new(StreamLoadConfig {
-            fe_url: cfg.doris.http_url.clone(),
-            be_url: cfg.doris.be_http_url.clone(),
-            user: mysql.user.clone(),
-            password: mysql.password.clone(),
-            timeout: Duration::from_secs(600),
-        })?),
-    );
+    let stream = StreamLoadConfig {
+        fe_url: cfg.doris.http_url.clone(),
+        be_url: cfg.doris.be_http_url.clone(),
+        user: mysql.user.clone(),
+        password: mysql.password.clone(),
+        timeout: Duration::from_secs(600),
+    };
+    loaders.insert("stream".into(), Arc::new(StreamLoader::new(stream.clone())?));
+    let mut sdk = SdkLoadConfig::new(stream);
+    if let Some(v) = cfg.doris.sdk.workers {
+        sdk.workers = v;
+    }
+    if let Some(v) = cfg.doris.sdk.linger_ms {
+        sdk.linger = Duration::from_millis(v);
+    }
+    if let Some(v) = cfg.doris.sdk.batch_mb {
+        sdk.batch_bytes = v << 20;
+    }
+    if let Some(v) = cfg.doris.sdk.gzip {
+        sdk.gzip = v;
+    }
+    if let Some(v) = cfg.doris.sdk.dry_run {
+        sdk.dry_run = v;
+    }
+    if let Some(v) = cfg.doris.sdk.dry_run_delay_ms {
+        sdk.dry_run_delay = Duration::from_millis(v);
+    }
+    loaders.insert("stream_sdk".into(), Arc::new(SdkLoader::new(sdk)?));
     if let Some(s3) = &cfg.doris.s3 {
         loaders.insert(
             "broker".into(),
@@ -169,6 +225,21 @@ async fn main() -> anyhow::Result<()> {
     node_cfg.raft_advertise = cfg.raft_advertise.clone().unwrap_or_else(|| cfg.raft_listen.clone());
     if let Some(mb) = cfg.memory_target_mb {
         node_cfg.memory.target_bytes = mb << 20;
+    }
+    if let Some(s) = cfg.max_admission_wait_s {
+        node_cfg.memory.max_admission_wait = Duration::from_secs(s);
+    }
+    if let Some(s) = cfg.catch_up_idle_s {
+        node_cfg.raft.catch_up_idle = Duration::from_secs(s);
+    }
+    if let Some(mb) = cfg.snapshot_send_mb_per_s {
+        node_cfg.raft.snapshot_send_bytes_per_sec = mb << 20;
+    }
+    if let Some(mb) = cfg.catch_up_hold_mb {
+        node_cfg.raft.catch_up_hold_bytes = mb << 20;
+    }
+    if let Some(mb) = cfg.wal_segment_mb {
+        node_cfg.wal_segment_bytes = mb << 20;
     }
     if let Some(n) = cfg.max_concurrent_loads {
         node_cfg.max_concurrent_loads = n;
@@ -199,6 +270,15 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 if node.is_leader() {
                     let attached: Vec<String> = node.tables().iter().map(|t| t.full_name()).collect();
+                    // Settings changed in the config file are applied to tables already attached.
+                    for t in tables.iter().filter(|t| attached.contains(&t.name)) {
+                        if node.table_config(&t.name).is_ok_and(|current| current != t.config()) {
+                            match node.set_table_config(&t.name, t.config()).await {
+                                Ok(()) => tracing::info!(table = %t.name, settings = ?t.config(), "table settings updated"),
+                                Err(e) => tracing::warn!(table = %t.name, error = %e, "updating table settings failed; will retry"),
+                            }
+                        }
+                    }
                     for t in tables.iter().filter(|t| !attached.contains(&t.name)) {
                         let Some((db, name)) = t.name.split_once('.') else {
                             tracing::error!(table = %t.name, "table name must be db.table");

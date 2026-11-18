@@ -37,7 +37,7 @@ pub struct WalOptions {
 
 impl WalOptions {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), segment_bytes: 64 << 20 }
+        Self { dir: dir.into(), segment_bytes: 100 << 20 }
     }
 }
 
@@ -286,6 +286,39 @@ pub fn write_container_file(path: &Path, kind: FileKind, frames: &[Frame]) -> io
         f.encode_into(&mut b);
     }
     replace_file(path, &b)
+}
+
+/// Writes a container file frame by frame, for content that should not be held in memory at
+/// once (a snapshot being received). The file is complete only after [`Self::finish`]; give it
+/// its final name with [`publish_file`].
+pub struct ContainerWriter {
+    file: File,
+    buf: BytesMut,
+}
+
+impl ContainerWriter {
+    pub fn create(path: &Path, kind: FileKind) -> io::Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(&FileHeader::new(kind, 0).encode())?;
+        Ok(Self { file, buf: BytesMut::new() })
+    }
+
+    pub fn append(&mut self, frame: &Frame) -> io::Result<()> {
+        self.buf.clear();
+        frame.encode_into(&mut self.buf);
+        self.file.write_all(&self.buf)
+    }
+
+    /// Makes the content durable.
+    pub fn finish(self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+/// Renames a finished file to its final name, durably.
+pub fn publish_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)?;
+    sync_dir(to.parent().unwrap_or(Path::new(".")))
 }
 
 fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {

@@ -45,11 +45,11 @@ The full design, decision log and open items are in [PLAN.md](PLAN.md).
 | Write-ahead log | Own segmented WAL: **CRC32C** on every frame and header, a versioned container format with a build tag (git SHA) in every file, group-commit `fsync` on a dedicated IO thread |
 | In-memory data | **Apache Arrow** columnar record batches (append-only) plus a primary-key hash index (Arrow `RowConverter`); versions tracked by sequence number |
 | Wire encoding | Arrow IPC (schema-less record-batch messages) inside Raft entries; MessagePack (`rmp-serde`) for metadata |
-| SQL parsing / execution | **Apache DataFusion** 55 (uses `sqlparser-rs`): custom catalog, schema and table providers; primary-key `=`/`IN` filter pushdown; a logical-plan cache keyed by SQL text; DDL/DML refused |
+| SQL parsing / execution | **Apache DataFusion** 55 (uses `sqlparser-rs`): custom catalog, schema and table providers; primary-key `=`/`IN` filter pushdown; a logical-plan cache keyed by SQL text; DDL and DML refused, except `INSERT` (upsert) and `DELETE` by primary key |
 | Client protocol | **Arrow Flight SQL** (`arrow-flight`, **tonic** gRPC): basic-auth handshake → bearer token, `DoPut` bulk ingest (with a `__delete` column for deletes), SQL queries, prepared statements with `$n` parameters, metadata calls (catalogs/schemas/tables/primary keys/SqlInfo), a fast path that answers primary-key lookups directly from the index |
 | Client drivers verified | **ADBC** Flight SQL driver (Python `adbc-driver-flightsql` 1.13), **Apache Arrow Flight SQL JDBC driver** 19.0.0, Rust `arrow-flight` client |
 | Node-to-node traffic | HTTP/1.1 keep-alive (**axum** server, **reqwest** client), MessagePack bodies; followers batch forwarded writes and leader check-ins for reads |
-| Doris loading | Stream Load over HTTPS (Parquet body, `merge_type=MERGE`, label-based idempotence); Broker Load (Parquet on S3 via `object_store`, then `LOAD LABEL` over MySQL protocol) |
+| Doris loading | Stream Load over HTTPS (Parquet body, `merge_type=MERGE`, label-based idempotence); Stream Load through the [`doris_rust_stream_load`](https://github.com/wushilin/doris_rust_stream_load) SDK (CSV, gzip, several workers; vendored in `vendor/`); Broker Load (Parquet on S3 via `object_store`, then `LOAD LABEL` over MySQL protocol) |
 | Doris metadata | `mysql_async` over TLS (**rustls** with aws-lc-rs): table schema read from `SHOW CREATE TABLE`, sequence floor via `max(__DORIS_SEQUENCE_COL__)` |
 | Files to Doris | **Parquet** (Snappy) |
 
@@ -80,9 +80,18 @@ The full design, decision log and open items are in [PLAN.md](PLAN.md).
   After a crash or leader change, the new leader checks the label in Doris before resubmitting.
   The same label is reused, so loads are idempotent. Under memory pressure the flusher sends
   larger batches, never smaller ones.
-- **Memory governor:** above a soft watermark, writers are slowed down; at the target, they wait
-  and then get a retryable backpressure error. A table that keeps failing to flush rejects new
-  writes upfront.
+- **Backpressure** (writes only; reads are never delayed):
+  - From 70% of a table's memory cap every write to it is delayed: 10 ms at 70%, doubling for
+    every further 5% (20 ms at 75%, 40 ms at 80%, ... 640 ms at 100%), up to 10 s. The cap is
+    soft: writes are held only at 120% of it, until loads to Doris free space.
+  - The node's memory target slows writes the same way up to 320 ms, and holds them at 100%.
+  - The caps apply to *buffer memory*: the buffered rows plus their key index. The process as a
+    whole uses more (see `process_memory_bytes` in `system.node`): allocator overhead, queries in
+    flight, and on the leader the files being built for a load, which can be several times the
+    size of the unit being loaded. Leave headroom for that when setting caps.
+  - A monitor works the delay out every 100 ms; a write only reads the published number.
+  - A write held longer than `max_admission_wait_s` (default 60) gets a retryable error. Only a
+    table whose loads keep failing rejects new writes upfront.
 - **Snapshots by reference** let the WAL be trimmed only once data is visible in Doris. A lagging
   follower catches up from a snapshot.
 - **Server binary** configured with TOML. Tables are attached by reading their definitions from
@@ -94,7 +103,7 @@ The full design, decision log and open items are in [PLAN.md](PLAN.md).
 
 ```bash
 cargo build --release
-cargo test --release            # 50 tests; the 2 VeloDB/Doris tests skip unless VELODB_* is set
+cargo test --release            # 68 tests; the 2 VeloDB/Doris tests skip unless VELODB_* is set
 ```
 
 Real-Doris tests (they create and drop their own tables in database `doris_ingress_test`):
@@ -124,6 +133,58 @@ cargo test --release --test velodb
 
 A single node works too: list only itself in `initial_members`.
 
+### Choosing a loader
+
+Set `loader` per table:
+
+| `loader` | How a flush unit reaches Doris | One Doris transaction per unit | After a crash or leader change |
+|---|---|---|---|
+| `stream` (default) | One Stream Load, Parquet body, under the unit's own label | Yes | Doris is asked about the label first; the unit is resubmitted only if needed |
+| `stream_sdk` | Several Stream Loads through the `doris_rust_stream_load` SDK: CSV rows, gzip, 4 workers, 5 ms linger, 80 MiB batches (all in `[doris.sdk]`) | No: the unit is split into several loads | The unit is sent again in full; repeated rows are no-ops through the sequence column |
+| `broker` | Parquet on S3, then Broker Load | Yes | As for `stream` |
+
+The `stream_sdk` loader has a dry run (`dry_run = true` under `[doris.sdk]`): nothing is sent to
+Doris, and every upload is acknowledged after `dry_run_delay_ms` (default 500). The whole flush
+path still runs, so it is a way to test the buffer and its backpressure without a Doris cluster.
+The flushed rows are discarded.
+
+With every loader a unit counts as done only when Doris reports its loads VISIBLE, and its rows
+stay in the buffer until then, plus the grace period. Only the leader loads. A load that is not
+visible after `load_timeout_s` (default 120) is abandoned and tried again, so a stalled connection
+cannot leave flushing dormant; `system.tables.load_running_ms` shows how long the current load
+has been running. Each drop is logged on every node
+(`trim: dropped a unit that is visible in Doris`, with the label and sequence range).
+
+**Changing a table's settings.** Edit the table's entry in the config file of the nodes and
+restart them (one at a time is fine). The leader compares the file with the settings in force and
+replicates the change, so every node switches at the same point in the log and the change
+survives restarts. `system.tables` shows the cap and grace period in force.
+
+**A follower that is behind.** The leader keeps the log a follower still needs for as long as
+that follower keeps answering (a catch-up cursor per follower), so a follower that was briefly
+away, or one that is installing a snapshot, continues from the log afterwards instead of needing
+another snapshot. A follower silent for `catch_up_idle_s` (default 30) loses its hold, as does
+the one furthest behind once the WAL kept for followers exceeds `catch_up_hold_mb` (default
+2048); such a follower is sent a snapshot when it returns. A follower that needs a snapshot holds
+the log from exactly the snapshot it is sent, so it continues from the log once it is installed. With all followers level, the leader
+purges everything its snapshot covers, as before.
+
+**Snapshot transfer.** A snapshot for a follower is streamed: the leader reads the entries
+behind the buffered rows from its WAL one at a time as it sends them, and the follower writes
+them to its snapshot file as they arrive, so the size of a snapshot is not limited by memory or
+by a request size. A send is paced to `snapshot_send_mb_per_s` (default 200). The WAL files a
+snapshot refers to are kept until it has been sent, even if newer snapshots are taken meanwhile.
+
+**Trim and watermarks.** Trimming is a Raft command (`Drop`): every node drops the same unit at
+the same point in the log. Each table has two replicated watermarks, `visible_seq` (highest
+sequence visible in Doris) and `trimmed_seq` (highest sequence trimmed from the buffer). They
+change only when a Raft entry is applied, are written into every snapshot, and so survive
+restarts and WAL trimming. WAL files are deleted per node, a whole file at a time, once a
+snapshot covers them and no buffered row still refers to them. Every node takes a snapshot
+(metadata only, a few KB) within a second of a trim, so the freed files go promptly; a snapshot
+is also taken every 2,000 log entries. A WAL file is closed at 100 MiB (`wal_segment_mb`). Both watermarks are columns of
+`system.tables`.
+
 ### Connect clients
 
 Python (ADBC):
@@ -139,7 +200,20 @@ cur = conn.cursor()   # use a fresh cursor for queries after an ingest
 cur.execute("SELECT * FROM db.orders WHERE id = 42"); print(cur.fetch_arrow_table())
 ```
 
-- **Deletes:** add a boolean `__delete` column set to true for the rows to delete.
+- **Inserts in SQL:** `INSERT INTO db.orders VALUES (...)`, with or without a column list, or
+  `INSERT INTO ... SELECT ...`. It is an upsert of full rows: a row with an existing primary key
+  is replaced, and a column that is left out is written as null. `__seq`, `__deleted` and
+  `__delete` cannot be set. For volume, prefer bulk ingest.
+- **Deletes:** add a boolean `__delete` column set to true for the rows to delete, or use SQL:
+  `DELETE FROM db.orders WHERE id = 42` (also `id IN (...)`; for a composite key, `a = 1 AND b = 2`
+  naming every key column). The `WHERE` clause must name the primary key and nothing else. The
+  count returned is the number of keys named: a key that is not in the buffer still gets a
+  tombstone, because its row may already be in Doris.
+- **No `UPDATE`:** insert the full row again instead.
+- **Node status in SQL:** `SELECT * FROM system.node` (role, leader, Raft log position, applied
+  sequence, memory) and `SELECT * FROM system.tables` (per table: rows in memory, split into
+  taking writes / waiting for Doris / in grace, plus flush failures). Each node answers for
+  itself, without the read barrier.
 - **Table names:** tables live in catalog `ingress`, so both `db.orders` and
   `ingress.db.orders` work.
 
@@ -152,6 +226,33 @@ jdbc:arrow-flight-sql://node1:8815/?useEncryption=false&user=admin&password=...
 On JDK 17+ the driver needs these JVM flags:
 `--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow
 --enable-native-access=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true`.
+
+### Web SQL console
+
+`webui/` is a small Go web UI: tables and their columns on the left, a SQL editor, and the
+result grid. It connects over Flight SQL and moves to the next node when one is unreachable.
+
+```bash
+cd webui && go build -o doris-ingress-ui .
+./doris-ingress-ui -nodes node1:8815,node2:8815,node3:8815 -user admin -password ...   # http://127.0.0.1:8080
+```
+
+"Bulk insert…" fills a table with generated rows (consecutive ids in the key column, random values
+elsewhere) through Flight SQL bulk ingest, and shows progress, speed and time left. It is limited
+to 50,000 rows per second by default (0 removes the limit). It needs a table
+with one integer key column.
+
+"Bulk query…" runs parallel primary-key lookups on random ids for a set time and shows queries per
+second and p50/p99 latency.
+
+The header shows how many nodes are up and which one leads; clicking it opens a cluster overview
+(per node: role, rows in memory, Raft log position, applied sequence; per table: rows in memory,
+split into taking writes / waiting for Doris / in grace, and flush state), read from each node's
+`system.node` and `system.tables` and pushed to the browser over a WebSocket twice a second. Console queries go to
+the nodes in turn, and both bulk tools spread their work over all nodes and report per node.
+
+The password defaults to `$DORIS_INGRESS_ADMIN_PASSWORD`. Results are capped at `-max-rows`
+(default 5000). The UI has no login of its own, so keep `-listen` on localhost.
 
 **Failover:** drivers do not fail over by themselves. Give clients every node's address (or put
 a load balancer or DNS name in front of them) and reconnect to another node on error.
@@ -177,15 +278,15 @@ cargo run --release --example write_bench           # in-process write path, no 
 
 ## Tests
 
-There are 50 automated tests, all passing:
+There are 68 automated tests, all passing:
 
 | Suite | Count | Covers |
 |---|---|---|
-| unit (`src/`) | 21 | WAL format: every single-bit flip is detected, torn frames, forward-compatible headers; memtable versioning and dedup; DDL parsing; Doris type mapping; per-writer rejection inside one batched Raft entry |
-| `tests/node.rs` | 12 | restart recovery from the WAL, snapshots trimming the WAL, flush protocol (label, intent, poll, grace, drop), memory backpressure, stuck tables rejecting writes, deletes, consistent snapshots |
-| `tests/cluster.rs` | 4 | leader failover with follower write forwarding, lagging-follower snapshot catch-up, multi-megabyte writes replicating, fast follower read barrier, all over real HTTP |
-| `tests/flight.rs` | 6 | auth, ingest, error mapping, metadata, prepared statements vs the primary-key fast path (same answers), DDL refused, multi-table scans |
-| `tests/loaders.rs` | 4 | Stream Load and Broker Load against a mock Doris FE/BE that tracks labels: redirects, unknown-label recovery, failures |
+| unit (`src/`) | 25 | WAL format: every single-bit flip is detected, torn frames, forward-compatible headers; memtable versioning and dedup; DDL parsing; Doris type mapping; per-writer rejection inside one batched Raft entry |
+| `tests/node.rs` | 18 | restart recovery from the WAL, snapshots trimming the WAL, flush protocol (label, intent, poll, grace, drop), memory backpressure, stuck tables rejecting writes, deletes, consistent snapshots |
+| `tests/cluster.rs` | 9 | leader failover with follower write forwarding, lagging-follower snapshot catch-up, multi-megabyte writes replicating, fast follower read barrier, all over real HTTP |
+| `tests/flight.rs` | 8 | auth, ingest, SQL `INSERT` and `DELETE` by primary key, error mapping, metadata, prepared statements vs the primary-key fast path (same answers), DDL refused, multi-table scans |
+| `tests/loaders.rs` | 5 | Stream Load and Broker Load against a mock Doris FE/BE that tracks labels: redirects, unknown-label recovery, failures |
 | `tests/storage_suite.rs` | 1 | openraft's full log storage and state machine conformance suite |
 | `tests/velodb.rs` | 2 | real VeloDB (managed Doris): HTTPS Stream Load with MERGE/delete, label states, sequence floor with tombstones |
 

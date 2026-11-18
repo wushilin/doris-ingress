@@ -15,7 +15,7 @@ pub enum Error {
     #[error("table {table} rejects writes: {reason}")]
     TableStuck { table: String, reason: String },
     /// Memory stayed at the hard watermark for the whole admission wait. Retryable.
-    #[error("memory target reached, waited {waited:?} for space")]
+    #[error("the buffer is full: waited {waited:?} for space while Doris catches up; retry")]
     Backpressure { waited: Duration },
     #[error("load failed: {0}")]
     Load(String),
