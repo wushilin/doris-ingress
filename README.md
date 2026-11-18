@@ -1,7 +1,12 @@
 # doris-ingress
 
-> **Status: proof of concept.** The core works end to end and is tested, but it has not been
-> hardened for production (see [Verdict](#verdict) and [Known gaps](#known-gaps)).
+> **Status: proof of concept** (updated 2026-11-18). The core works end to end and is tested, but
+> it has not been hardened for production (see [Verdict](#verdict) and [Known gaps](#known-gaps)).
+>
+> Since the first version: graduated write backpressure, per-follower catch-up from the log,
+> streamed snapshots for followers that fall too far behind, replicated trim watermarks, a load
+> timeout, a third loader (`stream_sdk`, with a dry run), SQL `INSERT` and `DELETE`, `system`
+> tables, and a web console. Automated tests went from 50 to 68.
 
 A Raft-replicated, in-memory write buffer in front of Apache Doris **Unique Key, merge-on-write**
 tables. It is meant to solve three problems:
@@ -92,8 +97,17 @@ The full design, decision log and open items are in [PLAN.md](PLAN.md).
   - A monitor works the delay out every 100 ms; a write only reads the published number.
   - A write held longer than `max_admission_wait_s` (default 60) gets a retryable error. Only a
     table whose loads keep failing rejects new writes upfront.
-- **Snapshots by reference** let the WAL be trimmed only once data is visible in Doris. A lagging
-  follower catches up from a snapshot.
+- **Replication repair:**
+  - Snapshots by reference let the WAL be trimmed only once data is visible in Doris.
+  - A follower that is behind but still answering catches up from the log, which the leader
+    keeps for it (one catch-up cursor per follower).
+  - A follower that is silent too long, or too far behind, is sent a streamed snapshot instead,
+    and continues from the log once it is installed.
+  - A new member with an empty disk joins with exactly the leader's buffer state.
+  - Trimming is a Raft command, with two replicated watermarks per table, so every node drops
+    the same data at the same point in the log.
+
+  Details are under [How to run](#how-to-run).
 - **Server binary** configured with TOML. Tables are attached by reading their definitions from
   Doris.
 
@@ -166,8 +180,8 @@ away, or one that is installing a snapshot, continues from the log afterwards in
 another snapshot. A follower silent for `catch_up_idle_s` (default 30) loses its hold, as does
 the one furthest behind once the WAL kept for followers exceeds `catch_up_hold_mb` (default
 2048); such a follower is sent a snapshot when it returns. A follower that needs a snapshot holds
-the log from exactly the snapshot it is sent, so it continues from the log once it is installed. With all followers level, the leader
-purges everything its snapshot covers, as before.
+the log from exactly the snapshot it is sent, so it continues from the log once it is installed.
+With all followers level, the leader purges everything its snapshot covers, as before.
 
 **Snapshot transfer.** A snapshot for a follower is streamed: the leader reads the entries
 behind the buffered rows from its WAL one at a time as it sends them, and the follower writes
@@ -182,8 +196,8 @@ change only when a Raft entry is applied, are written into every snapshot, and s
 restarts and WAL trimming. WAL files are deleted per node, a whole file at a time, once a
 snapshot covers them and no buffered row still refers to them. Every node takes a snapshot
 (metadata only, a few KB) within a second of a trim, so the freed files go promptly; a snapshot
-is also taken every 2,000 log entries. A WAL file is closed at 100 MiB (`wal_segment_mb`). Both watermarks are columns of
-`system.tables`.
+is also taken every 2,000 log entries. A WAL file is closed at 100 MiB (`wal_segment_mb`). Both
+watermarks are columns of `system.tables`.
 
 ### Connect clients
 
@@ -278,15 +292,15 @@ cargo run --release --example write_bench           # in-process write path, no 
 
 ## Tests
 
-There are 68 automated tests, all passing:
+There are 68 automated tests, all passing (last full run: 2026-11-18):
 
 | Suite | Count | Covers |
 |---|---|---|
-| unit (`src/`) | 25 | WAL format: every single-bit flip is detected, torn frames, forward-compatible headers; memtable versioning and dedup; DDL parsing; Doris type mapping; per-writer rejection inside one batched Raft entry |
-| `tests/node.rs` | 18 | restart recovery from the WAL, snapshots trimming the WAL, flush protocol (label, intent, poll, grace, drop), memory backpressure, stuck tables rejecting writes, deletes, consistent snapshots |
-| `tests/cluster.rs` | 9 | leader failover with follower write forwarding, lagging-follower snapshot catch-up, multi-megabyte writes replicating, fast follower read barrier, all over real HTTP |
+| unit (`src/`) | 25 | WAL format: every single-bit flip is detected, torn frames, forward-compatible headers; memtable versioning and dedup; DDL parsing; Doris type mapping; per-writer rejection inside one batched Raft entry; the backpressure delay curve |
+| `tests/node.rs` | 18 | restart recovery from the WAL, snapshots trimming the WAL, flush protocol (label, intent, poll, grace, drop), a restart mid-load checking the label before resubmitting, a hung load abandoned and retried, deletes, consistent snapshots. Backpressure: delays growing as a table fills while reads stay undelayed, a full table holding writers instead of failing them, the node memory target, stuck tables rejecting writes. Trim: a drop trimming the WAL promptly, watermarks and changed table settings surviving a restart |
+| `tests/cluster.rs` | 9 | leader failover with follower write forwarding, multi-megabyte writes replicating, fast follower read barrier, all over real HTTP. Repair, with injected faults on the links to one follower and under constant writes: catch-up from the log for a follower that keeps answering, a silent follower losing its hold and returning by snapshot, independent cursors per follower, a stalled follower released by the size limit and rejoining, a 96 MB snapshot streamed at a paced rate, a new member joining with exactly the leader's buffer state |
 | `tests/flight.rs` | 8 | auth, ingest, SQL `INSERT` and `DELETE` by primary key, error mapping, metadata, prepared statements vs the primary-key fast path (same answers), DDL refused, multi-table scans |
-| `tests/loaders.rs` | 5 | Stream Load and Broker Load against a mock Doris FE/BE that tracks labels: redirects, unknown-label recovery, failures |
+| `tests/loaders.rs` | 5 | Stream Load and Broker Load against a mock Doris FE/BE that tracks labels: redirects, unknown-label recovery, failures; the `stream_sdk` dry run |
 | `tests/storage_suite.rs` | 1 | openraft's full log storage and state machine conformance suite |
 | `tests/velodb.rs` | 2 | real VeloDB (managed Doris): HTTPS Stream Load with MERGE/delete, label states, sequence floor with tombstones |
 
@@ -353,13 +367,23 @@ benchmarked.
   majority fsync to a checksummed WAL.
 - **Clients:** standard ADBC and JDBC drivers work unmodified.
 
+- **Overload and repair:** when Doris is slower than the writers, writes are slowed and then
+  held rather than failed, and reads are unaffected. A follower that falls behind, stalls or
+  disappears is repaired from the log or by a streamed snapshot while writes continue, and ends
+  with the same state as the leader.
+
 **Not yet proven:** the merged Doris-side view, which is waiting on the Doris ADBC catalog, and
-behaviour under adversarial failures.
+behaviour under adversarial failures beyond the follower faults tested so far (no fault injection
+in the flush protocol, no linearizability checker).
 
 ## Known gaps
 
 - **Testing:**
-  - No crash or fault injection at each step of the flush protocol.
+  - No crash or fault injection at each step of the flush protocol. Fault injection covers
+    only the links to a follower (delayed or failing appends and snapshot sends), plus a load
+    that hangs and a restart in the middle of a load.
+  - Backpressure and snapshot repair are tested with a mock loader and small sizes (a 96 MB
+    snapshot at most), not at production data volumes.
   - No automated linearizability checker (Jepsen-style).
   - No power-loss simulation of the WAL.
   - Benchmarks ran on one host only.
